@@ -26,10 +26,11 @@ A headless, regime-adaptive trading system for real-time order flow analysis and
   - Daily profit target and loss limit enforcement
   - Dynamic symbol switching with automatic tick value updates
 
-- **Historical Replay**
-  - Polygon.io integration for historical market data
+- **Historical Replay & Backtesting**
+  - Polygon.io integration for ETF data (SPY, QQQ - free tier)
+  - Databento integration for real ES futures tick data
   - Replay any trading day at configurable speed
-  - Simulated tick generation from minute bars
+  - Batch backtesting across multiple dates
   - Full system integration (signals, trades, dashboard)
 
 - **Web Dashboard**
@@ -274,15 +275,41 @@ PYTHONPATH=. python scripts/simulate_trading.py
 
 ## Data Sources
 
-### Polygon.io (Historical Replay)
+### Polygon.io (ETF Replay - Free Tier)
 - Free tier available with delayed data
+- Use SPY/QQQ as ES proxy for backtesting
 - Minute bar data converted to simulated ticks
 - Sign up at https://polygon.io
 
-### Databento (Live Data)
-- Professional-grade tick data
-- Real-time and historical
+### Databento (ES Futures Tick Data)
+- Real ES futures tick-level data
+- Pay-per-use model (~$1.20/day for full session)
+- Historical and real-time available
 - Sign up at https://databento.com
+
+```python
+# Example: Backtest ES with Databento
+from src.data.adapters.databento import DatabentoAdapter
+
+adapter = DatabentoAdapter()
+contract = DatabentoAdapter.get_front_month_contract("ES")  # ESZ5
+
+ticks = adapter.get_session_ticks(
+    contract=contract,
+    date="2025-11-20",
+    start_time="09:30",
+    end_time="16:00"
+)
+# Returns ~750,000 ticks for full RTH session
+```
+
+### Databento Cost Estimates
+| Duration | Approx Ticks | Cost |
+|----------|--------------|------|
+| 1 hour | ~115,000 | ~$0.18 |
+| Full day (6.5h) | ~750,000 | ~$1.20 |
+| 1 week (5 days) | ~3.75M | ~$6.00 |
+| 1 month (20 days) | ~15M | ~$24.00 |
 
 ## License
 
