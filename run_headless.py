@@ -58,6 +58,7 @@ from src.core.capital import (
     get_tier_manager,
     TIERS,
 )
+from src.execution.bridge import ExecutionBridge
 from src.data.live_db import (
     create_session as db_create_session,
     end_session as db_end_session,
@@ -122,6 +123,7 @@ class HeadlessTradingSystem:
         self.persistence: Optional[StatePersistence] = None
         self.scheduler: Optional[TradingScheduler] = None
         self.tier_manager: Optional[TierManager] = None
+        self.execution_bridge: Optional[ExecutionBridge] = None
 
         # State
         self._running = False
@@ -136,6 +138,7 @@ class HeadlessTradingSystem:
         self._trade_count: int = 0
         self._pending_trade_context: dict = {}  # Context for trade being opened
         self._open_trade_ids: dict = {}  # bracket_id -> db trade id
+        self._db_order_ids: dict = {}  # bracket_id -> db order id (for live mode)
         self._total_commissions: float = 0.0
 
     async def setup(self) -> bool:
@@ -278,6 +281,7 @@ class HeadlessTradingSystem:
 
             user = os.getenv("RITHMIC_USER")
             password = os.getenv("RITHMIC_PASSWORD")
+            account_id = os.getenv("RITHMIC_ACCOUNT_ID")
 
             if not user or not password:
                 logger.error("RITHMIC_USER and RITHMIC_PASSWORD required")
@@ -287,11 +291,21 @@ class HeadlessTradingSystem:
                 )
                 return False
 
+            # For live mode, account_id is required
+            if self.mode == "live" and not account_id:
+                logger.error("RITHMIC_ACCOUNT_ID required for live trading")
+                await self.notifications.alert_system_error(
+                    "Rithmic account ID missing",
+                    "Set RITHMIC_ACCOUNT_ID for live trading",
+                )
+                return False
+
             self.data_adapter = RithmicAdapter(
                 user=user,
                 password=password,
                 system_name=os.getenv("RITHMIC_SYSTEM_NAME", "Rithmic Test"),
                 server_url=os.getenv("RITHMIC_SERVER", "rituz00100.rithmic.com:443"),
+                account_id=account_id,
             )
 
             # Register connection callbacks
@@ -317,6 +331,28 @@ class HeadlessTradingSystem:
                 return False
 
             logger.info(f"Connected to Rithmic, streaming {self.symbol}")
+
+            # Create execution bridge for live mode
+            if self.mode == "live" and self.manager:
+                self.execution_bridge = ExecutionBridge(
+                    execution_manager=self.manager,
+                    rithmic_adapter=self.data_adapter,
+                    on_fill_callback=self._on_live_fill,
+                    on_rejection_callback=self._on_live_rejection,
+                )
+
+                # Reconcile positions on startup
+                reconcile_result = await self.execution_bridge.reconcile_on_startup()
+                if not reconcile_result.get("reconciled"):
+                    # Position mismatch - session already halted by bridge
+                    await self.notifications.alert_system_error(
+                        "Position mismatch on startup",
+                        reconcile_result.get("action_required", "Manual review required"),
+                    )
+                    return False
+
+                logger.info("Execution bridge initialized for live trading")
+
             return True
 
         except ImportError:
@@ -600,6 +636,33 @@ class HeadlessTradingSystem:
                     f"(stacked={stacked_count}, regime={current_regime})"
                 )
 
+                # In live mode, submit the order through the execution bridge
+                if self.mode == "live" and self.execution_bridge:
+                    # Log order to database before submission
+                    if self._db_session_id:
+                        db_order_id = db_log_order(
+                            session_id=self._db_session_id,
+                            internal_order_id=order.bracket_id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            order_type="BRACKET",
+                            size=order.size,
+                            bracket_id=order.bracket_id,
+                            expected_price=order.entry_price,
+                            stop_price=order.stop_price,
+                        )
+                        # Track DB order ID for fill/rejection updates
+                        self._db_order_ids[order.bracket_id] = db_order_id
+
+                    # Remove from pending_orders (we're submitting directly)
+                    if order in self.manager.pending_orders:
+                        self.manager.pending_orders.remove(order)
+
+                    # Submit to broker asynchronously with retry logic
+                    asyncio.create_task(
+                        self.execution_bridge.submit_bracket_order_with_retry(order)
+                    )
+
     def _on_trade_complete(self, trade) -> None:
         """Handle completed trade - send Discord alert and update tier manager."""
         # Record trade with tier manager for balance tracking and tier progression
@@ -722,6 +785,63 @@ class HeadlessTradingSystem:
                 alert_type=AlertType.WARNING,
             )
 
+    async def _on_live_fill(self, fill_data: dict) -> None:
+        """Handle fill notification from live trading."""
+        rithmic_order_id = fill_data.get("order_id")
+        fill_price = fill_data.get("fill_price", 0)
+        fill_qty = fill_data.get("fill_qty", 0)
+        live_order = fill_data.get("order")
+
+        logger.info(f"Live fill: {rithmic_order_id} - {fill_qty} @ {fill_price}")
+
+        # Get our bracket_id to find the DB order ID
+        bracket_id = live_order.bracket_id if live_order else None
+        db_order_id = self._db_order_ids.get(bracket_id) if bracket_id else None
+
+        # Log to database using the correct DB order ID
+        if self._db_session_id and db_order_id:
+            db_update_order_filled(
+                order_id=db_order_id,
+                filled_size=fill_qty,
+                avg_fill_price=fill_price,
+            )
+            # Clean up tracking after fill
+            if bracket_id:
+                self._db_order_ids.pop(bracket_id, None)
+
+    async def _on_live_rejection(self, rejection_data: dict) -> None:
+        """Handle order rejection from live trading."""
+        rithmic_order_id = rejection_data.get("order_id")
+        reason = rejection_data.get("reason", "Unknown")
+        live_order = rejection_data.get("order")
+
+        logger.error(f"Live order rejected: {rithmic_order_id} - {reason}")
+
+        # Get our bracket_id to find the DB order ID
+        bracket_id = live_order.bracket_id if live_order else None
+        db_order_id = self._db_order_ids.get(bracket_id) if bracket_id else None
+
+        # Log to database using the correct DB order ID
+        if self._db_session_id and db_order_id:
+            db_update_order_rejected(
+                order_id=db_order_id,
+                reject_reason=reason,
+            )
+            # Clean up tracking after rejection
+            if bracket_id:
+                self._db_order_ids.pop(bracket_id, None)
+
+        # Alert via Discord
+        await self.notifications.send_alert(
+            title="Order Rejected",
+            message=(
+                f"**Order ID:** {rithmic_order_id}\n"
+                f"**Reason:** {reason}\n\n"
+                "Manual intervention may be required."
+            ),
+            alert_type=AlertType.ERROR,
+        )
+
     async def _on_tier_change(self, change: dict) -> None:
         """Handle tier change - send Discord notification, update session, and log to DB."""
         old_tier = TIERS[change["from_tier"]]
@@ -837,6 +957,34 @@ class HeadlessTradingSystem:
 
         logger.info("Auto-flattening positions...")
 
+        num_positions = len(self.manager.open_positions)
+
+        # In live mode, use the execution bridge to flatten
+        if self.mode == "live" and self.execution_bridge:
+            success = await self.execution_bridge.flatten_all()
+            if success:
+                await self.notifications.send_alert(
+                    title="Auto-Flatten Initiated",
+                    message=(
+                        f"Sent flatten request for {num_positions} position(s) before market close.\n"
+                        f"**Current Daily P&L:** ${self.manager.daily_pnl:+,.2f}\n\n"
+                        "Waiting for broker confirmation..."
+                    ),
+                    alert_type=AlertType.INFO,
+                )
+            else:
+                await self.notifications.send_alert(
+                    title="Auto-Flatten FAILED",
+                    message=(
+                        f"Failed to send flatten request!\n"
+                        f"**Open Positions:** {num_positions}\n\n"
+                        "MANUAL INTERVENTION REQUIRED"
+                    ),
+                    alert_type=AlertType.ERROR,
+                )
+            return
+
+        # Paper mode: simulate flatten locally
         # Get current price
         current_price = None
         for pos in self.manager.open_positions:

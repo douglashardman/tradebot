@@ -31,6 +31,10 @@ class TradingSession:
     # If True, require price to go 1 tick BEYOND target to fill (simulates being last in queue)
     conservative_fills: bool = False
 
+    # Slippage simulation for paper trading (in ticks)
+    # Simulates realistic fills by worsening entry price
+    paper_slippage_ticks: int = 1
+
     # Time Controls
     trading_start: time = field(default_factory=lambda: time(9, 30))
     trading_end: time = field(default_factory=lambda: time(15, 45))
@@ -93,6 +97,7 @@ class TradingSession:
             "stop_loss_ticks": self.stop_loss_ticks,
             "take_profit_ticks": self.take_profit_ticks,
             "breakeven_ticks": self.breakeven_ticks,
+            "paper_slippage_ticks": self.paper_slippage_ticks,
             "trading_start": self.trading_start.isoformat(),
             "trading_end": self.trading_end.isoformat(),
             "min_signal_strength": self.min_signal_strength,

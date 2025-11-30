@@ -1,24 +1,85 @@
-"""Rithmic data feed adapter with automatic reconnection."""
+"""Rithmic data feed adapter with automatic reconnection and order execution."""
 
 import asyncio
 import logging
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Any
 
 from src.core.types import Tick
 
 logger = logging.getLogger(__name__)
 
 
+class OrderState(Enum):
+    """Order lifecycle states."""
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    WORKING = "WORKING"
+    FILLED = "FILLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class LiveOrder:
+    """Tracks a live order submitted to Rithmic."""
+    order_id: str
+    symbol: str
+    exchange: str
+    side: str  # BUY or SELL
+    quantity: int
+    order_type: str  # MARKET or LIMIT
+    price: Optional[float] = None
+    stop_ticks: Optional[int] = None
+    target_ticks: Optional[int] = None
+
+    # Broker tracking
+    broker_order_id: Optional[str] = None
+    state: OrderState = OrderState.PENDING
+    filled_quantity: int = 0
+    filled_price: Optional[float] = None
+
+    # Timestamps
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    submitted_at: Optional[datetime] = None
+    filled_at: Optional[datetime] = None
+
+    # Bracket linkage
+    bracket_id: Optional[str] = None
+    is_entry: bool = False
+
+    # Rejection info
+    rejection_reason: Optional[str] = None
+
+
+@dataclass
+class LivePosition:
+    """Tracks a live position from Rithmic."""
+    symbol: str
+    exchange: str
+    side: str  # LONG or SHORT
+    quantity: int
+    avg_price: float
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    bracket_id: Optional[str] = None
+
+
 class RithmicAdapter:
     """
-    Adapter for Rithmic data feed via async_rithmic.
+    Adapter for Rithmic data feed and order execution via async_rithmic.
 
     Features:
     - Live tick data streaming
     - Automatic reconnection with exponential backoff
     - Connection health monitoring
-    - Heartbeat tracking
+    - Bracket order submission with server-side OCO
+    - Fill and rejection callback handling
+    - Position tracking and reconciliation
     """
 
     def __init__(
@@ -29,6 +90,7 @@ class RithmicAdapter:
         app_name: str = "OrderFlowTrader",
         app_version: str = "1.0",
         server_url: str = "rituz00100.rithmic.com:443",
+        account_id: Optional[str] = None,
     ):
         """
         Initialize Rithmic adapter.
@@ -40,6 +102,7 @@ class RithmicAdapter:
             app_name: Application name for identification
             app_version: Application version
             server_url: Rithmic server URL
+            account_id: Trading account ID (required for order submission)
         """
         self.user = user
         self.password = password
@@ -47,6 +110,7 @@ class RithmicAdapter:
         self.app_name = app_name
         self.app_version = app_version
         self.server_url = server_url
+        self.account_id = account_id
 
         self.client = None
         self.callbacks: List[Callable[[Tick], None]] = []
@@ -62,6 +126,13 @@ class RithmicAdapter:
         self._connection_lost_at: Optional[datetime] = None
         self._on_connected_callbacks: List[Callable] = []
         self._on_disconnected_callbacks: List[Callable] = []
+
+        # Order tracking
+        self._orders: Dict[str, LiveOrder] = {}  # order_id -> LiveOrder
+        self._positions: Dict[str, LivePosition] = {}  # symbol -> LivePosition
+        self._on_fill_callbacks: List[Callable] = []
+        self._on_rejection_callbacks: List[Callable] = []
+        self._order_lock = asyncio.Lock() if asyncio else None
 
     def register_callback(self, callback: Callable[[Tick], None]) -> None:
         """Register a callback to receive ticks."""
@@ -174,6 +245,14 @@ class RithmicAdapter:
             await self.client.connect()
             self._connected = True
             logger.info("Successfully connected to Rithmic")
+
+            # Set up order notification callbacks
+            await self._setup_order_callbacks()
+
+            # Reconcile positions on connect
+            if self.account_id:
+                await self.reconcile_positions()
+
             return True
 
         except ImportError:
@@ -365,6 +444,379 @@ class RithmicAdapter:
                 except Exception as e:
                     logger.error(f"Error in account callback: {e}")
 
+    # ==================== ORDER EXECUTION ====================
+
+    def on_fill(self, callback: Callable) -> None:
+        """Register callback for order fills."""
+        self._on_fill_callbacks.append(callback)
+
+    def on_rejection(self, callback: Callable) -> None:
+        """Register callback for order rejections."""
+        self._on_rejection_callbacks.append(callback)
+
+    async def _setup_order_callbacks(self) -> None:
+        """Set up order notification handlers with Rithmic client."""
+        if not self.client:
+            return
+
+        try:
+            # Register for order notifications
+            if hasattr(self.client, 'on_exchange_order_notification'):
+                self.client.on_exchange_order_notification += self._handle_order_notification
+                logger.info("Registered for order notifications")
+        except Exception as e:
+            logger.error(f"Failed to setup order callbacks: {e}")
+
+    async def _handle_order_notification(self, notification: dict) -> None:
+        """
+        Process order notification from Rithmic.
+
+        Handles fills, rejections, and order state changes.
+        """
+        try:
+            from async_rithmic import ExchangeOrderNotificationType
+
+            order_id = notification.get("order_id") or notification.get("user_tag")
+            notify_type = notification.get("notify_type")
+
+            # Find our tracked order
+            order = self._orders.get(order_id)
+
+            if notify_type == ExchangeOrderNotificationType.FILL:
+                fill_price = float(notification.get("fill_price", 0))
+                fill_qty = int(notification.get("fill_qty", 0))
+
+                logger.info(
+                    f"FILL: {order_id} - {fill_qty} @ {fill_price}"
+                )
+
+                if order:
+                    order.filled_quantity += fill_qty
+                    order.filled_price = fill_price
+                    order.filled_at = datetime.now(timezone.utc)
+
+                    if order.filled_quantity >= order.quantity:
+                        order.state = OrderState.FILLED
+                    else:
+                        order.state = OrderState.PARTIALLY_FILLED
+
+                # Notify callbacks
+                fill_data = {
+                    "order_id": order_id,
+                    "fill_price": fill_price,
+                    "fill_qty": fill_qty,
+                    "order": order,
+                    "raw": notification,
+                }
+                for callback in self._on_fill_callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(fill_data)
+                        else:
+                            callback(fill_data)
+                    except Exception as e:
+                        logger.error(f"Error in fill callback: {e}")
+
+            elif notify_type == ExchangeOrderNotificationType.REJECT:
+                reason = notification.get("text", "Unknown rejection reason")
+                logger.warning(f"REJECTED: {order_id} - {reason}")
+
+                if order:
+                    order.state = OrderState.REJECTED
+                    order.rejection_reason = reason
+
+                # Notify callbacks
+                rejection_data = {
+                    "order_id": order_id,
+                    "reason": reason,
+                    "order": order,
+                    "raw": notification,
+                }
+                for callback in self._on_rejection_callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(rejection_data)
+                        else:
+                            callback(rejection_data)
+                    except Exception as e:
+                        logger.error(f"Error in rejection callback: {e}")
+
+            elif notify_type == ExchangeOrderNotificationType.CANCEL:
+                logger.info(f"CANCELLED: {order_id}")
+                if order:
+                    order.state = OrderState.CANCELLED
+
+            elif notify_type == ExchangeOrderNotificationType.MODIFY:
+                logger.debug(f"MODIFIED: {order_id}")
+                if order:
+                    order.state = OrderState.WORKING
+
+        except Exception as e:
+            logger.error(f"Error handling order notification: {e}")
+
+    async def submit_bracket_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        stop_ticks: int,
+        target_ticks: int,
+        exchange: str = "CME",
+        bracket_id: Optional[str] = None,
+    ) -> Optional[LiveOrder]:
+        """
+        Submit a bracket order with server-side OCO stop/target.
+
+        Args:
+            symbol: Contract symbol (e.g., "MESH5")
+            side: "LONG" or "SHORT"
+            quantity: Number of contracts
+            stop_ticks: Stop loss distance in ticks
+            target_ticks: Take profit distance in ticks
+            exchange: Exchange (default "CME")
+            bracket_id: Optional ID to link related orders
+
+        Returns:
+            LiveOrder if submitted successfully, None otherwise.
+        """
+        if not self.client or not self._connected:
+            logger.error("Cannot submit order: not connected to Rithmic")
+            return None
+
+        if not self.account_id:
+            logger.error("Cannot submit order: account_id not configured")
+            return None
+
+        try:
+            from async_rithmic import OrderType, TransactionType
+
+            # Generate order ID
+            order_id = str(uuid.uuid4())[:12]
+
+            # Map side to transaction type
+            if side == "LONG":
+                txn_type = TransactionType.BUY
+            elif side == "SHORT":
+                txn_type = TransactionType.SELL
+            else:
+                logger.error(f"Invalid side: {side}")
+                return None
+
+            # Create order tracking object
+            order = LiveOrder(
+                order_id=order_id,
+                symbol=symbol,
+                exchange=exchange,
+                side="BUY" if side == "LONG" else "SELL",
+                quantity=quantity,
+                order_type="MARKET",
+                stop_ticks=stop_ticks,
+                target_ticks=target_ticks,
+                bracket_id=bracket_id or str(uuid.uuid4())[:8],
+                is_entry=True,
+            )
+
+            # Store before submission
+            async with self._order_lock:
+                self._orders[order_id] = order
+
+            logger.info(
+                f"Submitting bracket order: {side} {quantity} {symbol} "
+                f"(stop: {stop_ticks} ticks, target: {target_ticks} ticks)"
+            )
+
+            # Submit to Rithmic with server-side bracket
+            await self.client.submit_order(
+                order_id=order_id,
+                security_code=symbol,
+                exchange=exchange,
+                qty=quantity,
+                order_type=OrderType.MARKET,
+                transaction_type=txn_type,
+                account_id=self.account_id,
+                stop_ticks=stop_ticks,
+                target_ticks=target_ticks,
+            )
+
+            order.state = OrderState.SUBMITTED
+            order.submitted_at = datetime.now(timezone.utc)
+
+            logger.info(f"Bracket order submitted: {order_id}")
+            return order
+
+        except Exception as e:
+            logger.error(f"Failed to submit bracket order: {e}")
+            # Remove failed order from tracking
+            async with self._order_lock:
+                self._orders.pop(order_id, None)
+            return None
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """
+        Cancel a specific order.
+
+        Args:
+            order_id: Order ID to cancel
+
+        Returns:
+            True if cancellation sent, False otherwise.
+        """
+        if not self.client or not self._connected:
+            logger.error("Cannot cancel: not connected")
+            return False
+
+        try:
+            await self.client.cancel_order(order_id)
+            logger.info(f"Cancel request sent for {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False
+
+    async def cancel_all_orders(self) -> bool:
+        """
+        Cancel all open orders.
+
+        Returns:
+            True if cancellation sent, False otherwise.
+        """
+        if not self.client or not self._connected:
+            logger.error("Cannot cancel: not connected")
+            return False
+
+        try:
+            await self.client.cancel_all_orders()
+            logger.info("Cancel all orders request sent")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel all orders: {e}")
+            return False
+
+    async def exit_position(
+        self,
+        symbol: str,
+        exchange: str = "CME",
+    ) -> bool:
+        """
+        Exit all positions for a symbol (flatten).
+
+        Args:
+            symbol: Contract symbol
+            exchange: Exchange
+
+        Returns:
+            True if exit order sent, False otherwise.
+        """
+        if not self.client or not self._connected:
+            logger.error("Cannot exit: not connected")
+            return False
+
+        try:
+            if hasattr(self.client, 'exit_position'):
+                await self.client.exit_position(
+                    security_code=symbol,
+                    exchange=exchange,
+                    account_id=self.account_id,
+                )
+                logger.info(f"Exit position sent for {symbol}")
+                return True
+            else:
+                logger.warning("exit_position not available, using cancel_all_orders")
+                return await self.cancel_all_orders()
+        except Exception as e:
+            logger.error(f"Failed to exit position: {e}")
+            return False
+
+    async def list_orders(self) -> List[Dict[str, Any]]:
+        """
+        List current orders from Rithmic.
+
+        Returns:
+            List of order dictionaries from the broker.
+        """
+        if not self.client or not self._connected:
+            return []
+
+        try:
+            if hasattr(self.client, 'list_orders'):
+                orders = await self.client.list_orders()
+                return orders if orders else []
+            return []
+        except Exception as e:
+            logger.error(f"Failed to list orders: {e}")
+            return []
+
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """
+        Get current positions from Rithmic.
+
+        Returns:
+            List of position dictionaries from the broker.
+        """
+        if not self.client or not self._connected:
+            return []
+
+        try:
+            # Try different methods that might be available
+            if hasattr(self.client, 'get_positions'):
+                positions = await self.client.get_positions()
+                return positions if positions else []
+            elif hasattr(self.client, 'list_positions'):
+                positions = await self.client.list_positions()
+                return positions if positions else []
+            return []
+        except Exception as e:
+            logger.error(f"Failed to get positions: {e}")
+            return []
+
+    async def reconcile_positions(self) -> Dict[str, LivePosition]:
+        """
+        Reconcile local position tracking with broker positions.
+
+        Call this on startup and after reconnection to ensure
+        we have accurate position state.
+
+        Returns:
+            Dictionary of reconciled positions.
+        """
+        logger.info("Reconciling positions with broker...")
+
+        broker_positions = await self.get_positions()
+
+        # Clear and rebuild local tracking
+        self._positions.clear()
+
+        for pos in broker_positions:
+            symbol = pos.get("symbol") or pos.get("security_code", "")
+            exchange = pos.get("exchange", "CME")
+            qty = int(pos.get("quantity", 0) or pos.get("net_qty", 0))
+            avg_price = float(pos.get("avg_price", 0) or pos.get("avg_fill_price", 0))
+
+            if qty != 0:
+                side = "LONG" if qty > 0 else "SHORT"
+                live_pos = LivePosition(
+                    symbol=symbol,
+                    exchange=exchange,
+                    side=side,
+                    quantity=abs(qty),
+                    avg_price=avg_price,
+                    unrealized_pnl=float(pos.get("unrealized_pnl", 0)),
+                    realized_pnl=float(pos.get("realized_pnl", 0)),
+                )
+                self._positions[symbol] = live_pos
+                logger.info(f"Position: {side} {abs(qty)} {symbol} @ {avg_price}")
+
+        logger.info(f"Reconciliation complete: {len(self._positions)} positions")
+        return self._positions
+
+    def get_tracked_orders(self) -> Dict[str, LiveOrder]:
+        """Get all locally tracked orders."""
+        return self._orders.copy()
+
+    def get_tracked_positions(self) -> Dict[str, LivePosition]:
+        """Get all locally tracked positions."""
+        return self._positions.copy()
+
 
 # Factory function for easy instantiation from environment variables
 def create_rithmic_adapter_from_env() -> RithmicAdapter:
@@ -375,10 +827,16 @@ def create_rithmic_adapter_from_env() -> RithmicAdapter:
     password = os.getenv("RITHMIC_PASSWORD")
     server = os.getenv("RITHMIC_SERVER", "rituz00100.rithmic.com:443")
     system_name = os.getenv("RITHMIC_SYSTEM_NAME", "Rithmic Test")
+    account_id = os.getenv("RITHMIC_ACCOUNT_ID")
 
     if not user or not password:
         raise ValueError(
             "RITHMIC_USER and RITHMIC_PASSWORD environment variables required"
+        )
+
+    if not account_id:
+        logger.warning(
+            "RITHMIC_ACCOUNT_ID not set - order submission will be disabled"
         )
 
     return RithmicAdapter(
@@ -386,4 +844,5 @@ def create_rithmic_adapter_from_env() -> RithmicAdapter:
         password=password,
         server_url=server,
         system_name=system_name,
+        account_id=account_id,
     )

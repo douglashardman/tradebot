@@ -5,6 +5,8 @@ import os
 from datetime import datetime
 from typing import List, Dict, Optional
 
+from src.core.constants import TICK_SIZES
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "../../data/live_trades.db")
 
 
@@ -419,9 +421,9 @@ def update_order_filled(
     """Update order with fill information."""
     conn = get_connection()
 
-    # Get expected price to calculate slippage
+    # Get expected price and symbol to calculate slippage
     cursor = conn.execute(
-        "SELECT expected_price, side FROM orders WHERE id = ?", (order_id,)
+        "SELECT expected_price, side, symbol FROM orders WHERE id = ?", (order_id,)
     )
     row = cursor.fetchone()
     slippage_ticks = None
@@ -430,7 +432,13 @@ def update_order_filled(
         # Negative slippage is bad for buys, positive is bad for sells
         if row["side"] == "SELL":
             price_diff = -price_diff
-        slippage_ticks = price_diff / 0.25  # Assuming ES tick size
+
+        # Get tick size for this symbol (try 3-char prefix first, then 2-char)
+        symbol = row["symbol"] or "ES"
+        symbol_base = symbol[:3] if symbol[:3] in TICK_SIZES else symbol[:2]
+        tick_size = TICK_SIZES.get(symbol_base, 0.25)
+
+        slippage_ticks = price_diff / tick_size
 
     conn.execute("""
         UPDATE orders SET

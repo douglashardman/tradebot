@@ -1,6 +1,6 @@
 """Execution manager - handles trade execution and risk management."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Any
 import logging
 
@@ -112,6 +112,10 @@ class ExecutionManager:
         # Generate bracket order
         order = self._create_bracket_order(signal, size)
 
+        # Validation failed - return None
+        if order is None:
+            return None
+
         if self.session.mode == "paper":
             # Simulate immediate fill for paper trading
             self._simulate_fill(order, signal)
@@ -121,9 +125,19 @@ class ExecutionManager:
 
         return order
 
-    def _create_bracket_order(self, signal: Signal, size: int) -> BracketOrder:
-        """Create a bracket order from a signal."""
+    def _create_bracket_order(self, signal: Signal, size: int) -> Optional[BracketOrder]:
+        """
+        Create a bracket order from a signal.
+
+        Returns:
+            BracketOrder if valid, None if validation fails.
+        """
         entry_price = signal.price
+
+        # Validate entry price
+        if entry_price <= 0:
+            logger.error(f"Invalid entry price: {entry_price}")
+            return None
 
         if signal.direction == "LONG":
             stop_price = entry_price - (self.session.stop_loss_ticks * self.tick_size)
@@ -131,6 +145,30 @@ class ExecutionManager:
         else:
             stop_price = entry_price + (self.session.stop_loss_ticks * self.tick_size)
             target_price = entry_price - (self.session.take_profit_ticks * self.tick_size)
+
+        # Validate stop and target prices are positive
+        if stop_price <= 0 or target_price <= 0:
+            logger.error(
+                f"Invalid bracket prices: entry={entry_price}, "
+                f"stop={stop_price}, target={target_price}"
+            )
+            return None
+
+        # Validate price ordering based on direction
+        if signal.direction == "LONG":
+            if not (stop_price < entry_price < target_price):
+                logger.error(
+                    f"Invalid LONG bracket ordering: stop={stop_price} < "
+                    f"entry={entry_price} < target={target_price}"
+                )
+                return None
+        else:  # SHORT
+            if not (target_price < entry_price < stop_price):
+                logger.error(
+                    f"Invalid SHORT bracket ordering: target={target_price} < "
+                    f"entry={entry_price} < stop={stop_price}"
+                )
+                return None
 
         return BracketOrder(
             symbol=self.symbol,
@@ -143,15 +181,25 @@ class ExecutionManager:
         )
 
     def _simulate_fill(self, order: BracketOrder, signal: Signal) -> None:
-        """Simulate order fill for paper trading."""
-        now = datetime.now()
+        """Simulate order fill for paper trading with slippage."""
+        now = datetime.now(timezone.utc)
+
+        # Apply slippage to entry price (worsen the fill)
+        slippage_ticks = getattr(self.session, 'paper_slippage_ticks', 0)
+        slipped_entry = order.entry_price
+        if slippage_ticks > 0:
+            slippage_amount = slippage_ticks * self.tick_size
+            if order.side == "LONG":
+                slipped_entry += slippage_amount  # Worse fill for long
+            else:
+                slipped_entry -= slippage_amount  # Worse fill for short
 
         # Create position
         position = Position(
             symbol=order.symbol,
             side=order.side,
             size=order.size,
-            entry_price=order.entry_price,
+            entry_price=slipped_entry,
             entry_time=now,
             stop_price=order.stop_price,
             target_price=order.target_price,
@@ -161,9 +209,11 @@ class ExecutionManager:
         self.open_positions.append(position)
         order.is_active = True
         order.is_filled = True
+        order.entry_price = slipped_entry  # Update with actual fill price
 
+        slippage_note = f" (slippage: {slippage_ticks} ticks)" if slippage_ticks > 0 else ""
         logger.info(
-            f"Paper fill: {order.side} {order.size} {order.symbol} @ {order.entry_price} "
+            f"Paper fill: {order.side} {order.size} {order.symbol} @ {slipped_entry}{slippage_note} "
             f"(stop: {order.stop_price}, target: {order.target_price})"
         )
 
@@ -222,7 +272,7 @@ class ExecutionManager:
         reason: str
     ) -> Trade:
         """Close a position and create a trade record."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # Calculate P&L
         price_diff = exit_price - position.entry_price
@@ -256,6 +306,9 @@ class ExecutionManager:
 
         if self.session.mode == "paper":
             self.paper_balance += pnl
+            if self.paper_balance < 0:
+                self.paper_balance = 0
+                logger.warning("Paper balance hit zero floor")
 
         logger.info(
             f"Position closed: {reason} - {trade.side} {trade.size} {trade.symbol} "

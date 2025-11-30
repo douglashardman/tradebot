@@ -6,6 +6,8 @@ from typing import Optional, Literal
 from enum import Enum
 import uuid
 
+from src.core.constants import TICK_SIZES
+
 
 class OrderStatus(Enum):
     """Order lifecycle status."""
@@ -156,8 +158,11 @@ class Position:
         if self.side == "SHORT":
             price_diff = -price_diff
 
+        # Get tick size for this symbol (try 3-char prefix first, then 2-char)
+        symbol_base = self.symbol[:3] if self.symbol[:3] in TICK_SIZES else self.symbol[:2]
+        tick_size = TICK_SIZES.get(symbol_base, 0.25)
+
         # Convert to ticks, then to dollars
-        tick_size = 0.25  # Default for ES/MES
         ticks = price_diff / tick_size
         self.unrealized_pnl = ticks * tick_value * self.size
 
@@ -192,7 +197,7 @@ class Trade:
     # Exit
     exit_price: float
     exit_time: datetime
-    exit_reason: Literal["TARGET", "STOP", "MANUAL", "HALTED", "TIMEOUT"]
+    exit_reason: Literal["TARGET", "STOP", "MANUAL", "HALTED", "TIMEOUT", "AUTO_FLATTEN"]
 
     # P&L
     pnl: float
