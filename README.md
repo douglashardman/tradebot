@@ -125,15 +125,26 @@ sudo systemctl start tradebot
 # Rithmic (for live trading)
 RITHMIC_USER=your_username
 RITHMIC_PASSWORD=your_password
+RITHMIC_ACCOUNT_ID=your_account_id  # Required for live mode
 
 # Discord (required - all status goes here)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx/yyy
 
 # Trading config
 TRADING_SYMBOL=MES
+TRADING_MODE=paper  # paper or live
 DAILY_PROFIT_TARGET=500
 DAILY_LOSS_LIMIT=-300
 ```
+
+### Trading Modes
+
+| Mode | Description |
+|------|-------------|
+| `paper` | Paper trading with simulated fills. Uses Rithmic/Databento for data only. |
+| `live` | Live trading with real order execution via Rithmic. Requires RITHMIC_ACCOUNT_ID. |
+
+**IMPORTANT:** Live mode will execute REAL trades with REAL money. Test thoroughly in paper mode first.
 
 ### What You'll Receive on Discord
 
@@ -465,6 +476,44 @@ PYTHONPATH=. python scripts/stress_tests.py --time-of-day   # Hourly breakdown
 PYTHONPATH=. python scripts/stress_tests.py --day-of-week   # Monday-Friday analysis
 PYTHONPATH=. python scripts/stress_tests.py --monte-carlo   # 1000 randomizations
 ```
+
+## Execution System Audit (November 2025)
+
+The execution layer underwent a comprehensive code audit with 7 critical/high issues identified and fixed:
+
+### Issues Fixed
+
+| ID | Severity | Issue | Fix |
+|----|----------|-------|-----|
+| C1 | Critical | Fill deduplication race condition | Moved check inside asyncio lock |
+| C2 | Critical | Wrong attribute name in tier change | Fixed `self.execution_manager` → `self.manager` |
+| C3 | Critical | flatten_all() return check always truthy | Check `result.get("success")` instead |
+| C4 | Critical | Tier change P&L miscalculation | Store tick values on Position at entry |
+| H1 | High | fill_id collision for same-price fills | Added timestamp to fill_id generation |
+| H2 | High | Unbounded _processed_fills memory growth | Added max size limit with auto-clear |
+| H3 | High | Order submission bypass task tracking | Use tracked submission method |
+
+### Key Changes
+
+**`src/execution/bridge.py`**
+- Fill deduplication now atomic inside lock (lines 154-166)
+- fill_id includes timestamp for uniqueness
+- _processed_fills bounded to 1000 entries
+- Position creation captures tick_size/tick_value
+
+**`src/execution/manager.py`**
+- Position stores tick values at entry time
+- _close_position uses position's tick values for P&L
+- Protects against tier change mid-trade miscalculation
+
+**`src/execution/orders.py`**
+- Position dataclass includes tick_size/tick_value fields
+- update_pnl uses captured values when available
+
+**`run_headless.py`**
+- Fixed attribute reference for tier changes
+- Fixed flatten return value handling
+- Order submission uses tracked method
 
 ## License
 

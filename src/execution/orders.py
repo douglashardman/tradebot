@@ -141,13 +141,17 @@ class Position:
     position_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     bracket_id: Optional[str] = None
 
+    # Tick values captured at position open (for correct P&L calculation if symbol changes)
+    tick_size: Optional[float] = None
+    tick_value: Optional[float] = None
+
     def update_pnl(self, current_price: float, tick_value: float) -> float:
         """
         Update unrealized P&L based on current price.
 
         Args:
             current_price: Current market price
-            tick_value: Dollar value per tick
+            tick_value: Dollar value per tick (used as fallback if position doesn't have its own)
 
         Returns:
             Unrealized P&L in dollars
@@ -158,13 +162,19 @@ class Position:
         if self.side == "SHORT":
             price_diff = -price_diff
 
-        # Get tick size for this symbol (try 3-char prefix first, then 2-char)
-        symbol_base = self.symbol[:3] if self.symbol[:3] in TICK_SIZES else self.symbol[:2]
-        tick_size = TICK_SIZES.get(symbol_base, 0.25)
+        # Use position's captured tick values if available (for tier change safety)
+        # Otherwise fall back to symbol lookup or provided value
+        if self.tick_size is not None:
+            ts = self.tick_size
+        else:
+            symbol_base = self.symbol[:3] if self.symbol[:3] in TICK_SIZES else self.symbol[:2]
+            ts = TICK_SIZES.get(symbol_base, 0.25)
+
+        tv = self.tick_value if self.tick_value is not None else tick_value
 
         # Convert to ticks, then to dollars
-        ticks = price_diff / tick_size
-        self.unrealized_pnl = ticks * tick_value * self.size
+        ticks = price_diff / ts
+        self.unrealized_pnl = ticks * tv * self.size
 
         return self.unrealized_pnl
 
@@ -209,6 +219,7 @@ class Trade:
 
     # Context
     trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    bracket_id: Optional[str] = None  # Links to originating bracket order
     signal_pattern: Optional[str] = None
     regime: Optional[str] = None
     regime_confidence: float = 0.0
@@ -228,6 +239,7 @@ class Trade:
             "target_price": self.target_price,
             "pnl": self.pnl,
             "pnl_ticks": self.pnl_ticks,
+            "bracket_id": self.bracket_id,
             "signal_pattern": self.signal_pattern,
             "regime": self.regime,
         }

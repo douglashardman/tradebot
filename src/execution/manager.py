@@ -1,5 +1,6 @@
 """Execution manager - handles trade execution and risk management."""
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Any
 import logging
@@ -50,7 +51,11 @@ class ExecutionManager:
         self.on_trade_callbacks: List[Callable[[Trade], None]] = []
         self.on_position_callbacks: List[Callable[[Position], None]] = []
 
-        # Paper trading state
+        # Async lock for position list mutations (used by bridge for live mode)
+        self._position_lock: asyncio.Lock = asyncio.Lock()
+
+        # Paper trading state (always initialize to prevent AttributeError)
+        self.paper_balance: Optional[float] = None
         if session.mode == "paper":
             self.paper_balance = session.paper_starting_balance
 
@@ -194,7 +199,8 @@ class ExecutionManager:
             else:
                 slipped_entry -= slippage_amount  # Worse fill for short
 
-        # Create position
+        # Create position with tick values captured at entry time
+        # This ensures P&L is calculated correctly even if tier/symbol changes mid-trade
         position = Position(
             symbol=order.symbol,
             side=order.side,
@@ -204,6 +210,8 @@ class ExecutionManager:
             stop_price=order.stop_price,
             target_price=order.target_price,
             bracket_id=order.bracket_id,
+            tick_size=self.tick_size,
+            tick_value=self.tick_value,
         )
 
         self.open_positions.append(position)
@@ -217,9 +225,12 @@ class ExecutionManager:
             f"(stop: {order.stop_price}, target: {order.target_price})"
         )
 
-        # Notify callbacks
+        # Notify callbacks (with error isolation)
         for callback in self.on_position_callbacks:
-            callback(position)
+            try:
+                callback(position)
+            except Exception as e:
+                logger.error(f"Error in position callback: {e}")
 
     def update_prices(self, current_price: float) -> None:
         """
@@ -274,13 +285,18 @@ class ExecutionManager:
         """Close a position and create a trade record."""
         now = datetime.now(timezone.utc)
 
-        # Calculate P&L
+        # Use position's captured tick values if available (protects against tier/symbol changes)
+        # Fall back to manager's values for backward compatibility
+        tick_size = position.tick_size if position.tick_size is not None else self.tick_size
+        tick_value = position.tick_value if position.tick_value is not None else self.tick_value
+
+        # Calculate P&L using the correct tick values for this position
         price_diff = exit_price - position.entry_price
         if position.side == "SHORT":
             price_diff = -price_diff
 
-        pnl_ticks = int(price_diff / self.tick_size)
-        pnl = pnl_ticks * self.tick_value * position.size
+        pnl_ticks = round(price_diff / tick_size)
+        pnl = pnl_ticks * tick_value * position.size
 
 
         # Create trade record
@@ -297,6 +313,7 @@ class ExecutionManager:
             target_price=position.target_price,
             pnl=pnl,
             pnl_ticks=pnl_ticks,
+            bracket_id=position.bracket_id,
         )
 
         # Update session state
@@ -321,9 +338,12 @@ class ExecutionManager:
         elif self.daily_pnl <= self.session.daily_loss_limit:
             self._halt("Daily loss limit reached")
 
-        # Notify callbacks
+        # Notify callbacks (with error isolation)
         for callback in self.on_trade_callbacks:
-            callback(trade)
+            try:
+                callback(trade)
+            except Exception as e:
+                logger.error(f"Error in trade callback: {e}")
 
         return trade
 

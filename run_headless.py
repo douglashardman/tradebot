@@ -658,10 +658,12 @@ class HeadlessTradingSystem:
                     if order in self.manager.pending_orders:
                         self.manager.pending_orders.remove(order)
 
-                    # Submit to broker asynchronously with retry logic
-                    asyncio.create_task(
-                        self.execution_bridge.submit_bracket_order_with_retry(order)
+                    # Submit to broker asynchronously with retry logic and tracking
+                    # Uses _submit_and_track to record success/failure in bridge
+                    task = asyncio.create_task(
+                        self.execution_bridge._submit_and_track(order)
                     )
+                    self.execution_bridge._submission_tasks[order.bracket_id] = task
 
     def _on_trade_complete(self, trade) -> None:
         """Handle completed trade - send Discord alert and update tier manager."""
@@ -851,7 +853,25 @@ class HeadlessTradingSystem:
         emoji = "🎉" if direction == "UP" else "⚠️"
 
         old_symbol = self.symbol
-        new_symbol = new_tier["instrument"]
+        new_instrument = new_tier["instrument"]
+
+        # Extract contract month from old symbol (e.g., "MESH25" -> "H25", "ESZ25" -> "Z25")
+        # Then construct full symbol for new instrument
+        contract_month = ""
+        if len(old_symbol) > 3 and old_symbol[:3] in ("MES", "MNQ"):
+            contract_month = old_symbol[3:]  # e.g., "MESH25" -> "H25"
+        elif len(old_symbol) > 2 and old_symbol[:2] in ("ES", "NQ"):
+            contract_month = old_symbol[2:]  # e.g., "ESH25" -> "H25"
+
+        # Construct new symbol with contract month
+        if contract_month:
+            new_symbol = f"{new_instrument}{contract_month}"
+        else:
+            new_symbol = new_instrument  # Fallback to generic if no month found
+            logger.warning(
+                f"Could not extract contract month from {old_symbol}, "
+                f"using generic symbol: {new_symbol}"
+            )
 
         # Log tier change to database
         if self._db_session_id:
@@ -873,6 +893,10 @@ class HeadlessTradingSystem:
             self.session.daily_loss_limit = new_tier["daily_loss_limit"]
             self.session.max_position_size = new_tier["max_contracts"]
             self.symbol = new_symbol
+
+        # Update execution manager (recalculates tick values)
+        if self.manager:
+            self.manager.update_symbol(new_symbol)
 
         # Update engine symbol
         if self.engine:
@@ -961,14 +985,19 @@ class HeadlessTradingSystem:
 
         # In live mode, use the execution bridge to flatten
         if self.mode == "live" and self.execution_bridge:
-            success = await self.execution_bridge.flatten_all()
-            if success:
+            flatten_result = await self.execution_bridge.flatten_all()
+            if flatten_result.get("success"):
+                verified_msg = ""
+                if flatten_result.get("verified"):
+                    verified_msg = "\n**Status:** Verified - all positions closed"
+                elif flatten_result.get("broker_positions") is not None:
+                    verified_msg = f"\n**Warning:** {flatten_result['broker_positions']} position(s) may still be open"
                 await self.notifications.send_alert(
                     title="Auto-Flatten Initiated",
                     message=(
                         f"Sent flatten request for {num_positions} position(s) before market close.\n"
-                        f"**Current Daily P&L:** ${self.manager.daily_pnl:+,.2f}\n\n"
-                        "Waiting for broker confirmation..."
+                        f"**Current Daily P&L:** ${self.manager.daily_pnl:+,.2f}"
+                        f"{verified_msg}"
                     ),
                     alert_type=AlertType.INFO,
                 )
