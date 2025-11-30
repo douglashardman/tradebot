@@ -1,0 +1,222 @@
+"""Order types and position management."""
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, Literal
+from enum import Enum
+import uuid
+
+
+class OrderStatus(Enum):
+    """Order lifecycle status."""
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    FILLED = "FILLED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+class OrderType(Enum):
+    """Order types."""
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP = "STOP"
+    STOP_LIMIT = "STOP_LIMIT"
+
+
+@dataclass
+class Order:
+    """Represents a single order."""
+    symbol: str
+    side: Literal["BUY", "SELL"]
+    size: int
+    order_type: OrderType = OrderType.MARKET
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+
+    # Identifiers
+    order_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    client_order_id: Optional[str] = None
+
+    # Status tracking
+    status: OrderStatus = OrderStatus.PENDING
+    filled_size: int = 0
+    filled_price: Optional[float] = None
+
+    # Timestamps
+    created_at: datetime = field(default_factory=datetime.now)
+    submitted_at: Optional[datetime] = None
+    filled_at: Optional[datetime] = None
+
+    # Metadata
+    signal_id: Optional[str] = None
+    notes: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "order_id": self.order_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "size": self.size,
+            "order_type": self.order_type.value,
+            "limit_price": self.limit_price,
+            "stop_price": self.stop_price,
+            "status": self.status.value,
+            "filled_size": self.filled_size,
+            "filled_price": self.filled_price,
+            "created_at": self.created_at.isoformat(),
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+        }
+
+
+@dataclass
+class BracketOrder:
+    """
+    A bracket order with entry, stop loss, and take profit.
+
+    This is the primary order type for our system.
+    """
+    symbol: str
+    side: Literal["LONG", "SHORT"]
+    size: int
+    entry_price: float
+    stop_price: float
+    target_price: float
+
+    # Identifiers
+    bracket_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    signal_id: Optional[str] = None
+
+    # Component orders (populated on submission)
+    entry_order: Optional[Order] = None
+    stop_order: Optional[Order] = None
+    target_order: Optional[Order] = None
+
+    # Status
+    is_active: bool = False
+    is_filled: bool = False
+    is_closed: bool = False
+
+    # Timestamps
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> dict:
+        return {
+            "bracket_id": self.bracket_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "size": self.size,
+            "entry_price": self.entry_price,
+            "stop_price": self.stop_price,
+            "target_price": self.target_price,
+            "is_active": self.is_active,
+            "is_filled": self.is_filled,
+            "is_closed": self.is_closed,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+@dataclass
+class Position:
+    """Represents an open position."""
+    symbol: str
+    side: Literal["LONG", "SHORT"]
+    size: int
+    entry_price: float
+    entry_time: datetime
+
+    # P&L tracking
+    current_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+
+    # Stops
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
+
+    # Identifiers
+    position_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    bracket_id: Optional[str] = None
+
+    def update_pnl(self, current_price: float, tick_value: float) -> float:
+        """
+        Update unrealized P&L based on current price.
+
+        Args:
+            current_price: Current market price
+            tick_value: Dollar value per tick
+
+        Returns:
+            Unrealized P&L in dollars
+        """
+        self.current_price = current_price
+        price_diff = current_price - self.entry_price
+
+        if self.side == "SHORT":
+            price_diff = -price_diff
+
+        # Convert to ticks, then to dollars
+        tick_size = 0.25  # Default for ES/MES
+        ticks = price_diff / tick_size
+        self.unrealized_pnl = ticks * tick_value * self.size
+
+        return self.unrealized_pnl
+
+    def to_dict(self) -> dict:
+        return {
+            "position_id": self.position_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "size": self.size,
+            "entry_price": self.entry_price,
+            "entry_time": self.entry_time.isoformat(),
+            "current_price": self.current_price,
+            "unrealized_pnl": self.unrealized_pnl,
+            "stop_price": self.stop_price,
+            "target_price": self.target_price,
+        }
+
+
+@dataclass
+class Trade:
+    """A completed trade (entry + exit)."""
+    symbol: str
+    side: Literal["LONG", "SHORT"]
+    size: int
+
+    # Entry
+    entry_price: float
+    entry_time: datetime
+
+    # Exit
+    exit_price: float
+    exit_time: datetime
+    exit_reason: Literal["TARGET", "STOP", "MANUAL", "HALTED", "TIMEOUT"]
+
+    # P&L
+    pnl: float
+    pnl_ticks: int
+
+    # Context
+    trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    signal_pattern: Optional[str] = None
+    regime: Optional[str] = None
+    regime_confidence: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "trade_id": self.trade_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "size": self.size,
+            "entry_price": self.entry_price,
+            "entry_time": self.entry_time.isoformat(),
+            "exit_price": self.exit_price,
+            "exit_time": self.exit_time.isoformat(),
+            "exit_reason": self.exit_reason,
+            "pnl": self.pnl,
+            "pnl_ticks": self.pnl_ticks,
+            "signal_pattern": self.signal_pattern,
+            "regime": self.regime,
+        }
