@@ -27,6 +27,10 @@ class TradingSession:
     take_profit_ticks: int = 4     # 1.00 points ($5.00 on MES)
     breakeven_ticks: int = 2       # Move stop to breakeven after 2 ticks profit
 
+    # Fill simulation (for backtesting realism)
+    # If True, require price to go 1 tick BEYOND target to fill (simulates being last in queue)
+    conservative_fills: bool = False
+
     # Time Controls
     trading_start: time = field(default_factory=lambda: time(9, 30))
     trading_end: time = field(default_factory=lambda: time(15, 45))

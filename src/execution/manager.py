@@ -164,9 +164,15 @@ class ExecutionManager:
         Update positions with current price and check stops/targets.
 
         Call this on each tick or bar close.
+
+        If session.conservative_fills is True, targets require price to go
+        1 tick BEYOND the target to fill (simulates being last in queue).
         """
         if not self.open_positions:
             return
+
+        # Check if we need conservative fill logic (price must go through target)
+        conservative = getattr(self.session, 'conservative_fills', False)
 
         for position in list(self.open_positions):  # Copy list to allow modification
             position.update_pnl(current_price, self.tick_value)
@@ -177,11 +183,25 @@ class ExecutionManager:
             elif position.side == "SHORT" and current_price >= position.stop_price:
                 self._close_position(position, position.stop_price, "STOP")
 
-            # Check take profit - exit at target price (not current price which may have run past)
-            elif position.side == "LONG" and current_price >= position.target_price:
-                self._close_position(position, position.target_price, "TARGET")
-            elif position.side == "SHORT" and current_price <= position.target_price:
-                self._close_position(position, position.target_price, "TARGET")
+            # Check take profit
+            # If conservative_fills: require price to go 1 tick PAST target (simulate queue position)
+            # Standard: fill when price touches target
+            elif position.side == "LONG":
+                if conservative:
+                    # Must go BEYOND target (strict inequality = 1 tick through)
+                    if current_price > position.target_price:
+                        self._close_position(position, position.target_price, "TARGET")
+                else:
+                    if current_price >= position.target_price:
+                        self._close_position(position, position.target_price, "TARGET")
+            elif position.side == "SHORT":
+                if conservative:
+                    # Must go BEYOND target (strict inequality = 1 tick through)
+                    if current_price < position.target_price:
+                        self._close_position(position, position.target_price, "TARGET")
+                else:
+                    if current_price <= position.target_price:
+                        self._close_position(position, position.target_price, "TARGET")
 
     def _close_position(
         self,

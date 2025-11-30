@@ -75,7 +75,9 @@ def run_backtest(
     date: str,
     start_time: str,
     end_time: str,
-    budget_remaining: float
+    budget_remaining: float,
+    conservative_fills: bool = False,
+    daily_loss_limit: float = -400.0
 ) -> dict:
     """
     Run a single backtest using Databento data.
@@ -93,6 +95,8 @@ def run_backtest(
 
     print(f"\n{'='*60}")
     print(f"Backtest: {contract} on {date} ({start_time}-{end_time})")
+    if conservative_fills:
+        print(f"MODE: CONSERVATIVE FILLS (require 1 tick through target)")
     print(f"Estimated: {estimated_ticks:,} ticks, ${estimated_cost:.2f}")
     print(f"Budget remaining: ${budget_remaining:.2f}")
     print(f"{'='*60}")
@@ -154,13 +158,14 @@ def run_backtest(
         mode="paper",
         symbol=symbol,
         daily_profit_target=100000.0,  # No profit cap - let winners run
-        daily_loss_limit=-400.0,  # Keep loss limit
+        daily_loss_limit=daily_loss_limit,  # Configurable loss limit
         max_position_size=1,
         max_concurrent_trades=1,
         stop_loss_ticks=16,  # 4 points for ES
         take_profit_ticks=24,  # 6 points for ES
         trading_start=time(9, 30),
         trading_end=time(16, 0),
+        conservative_fills=conservative_fills,  # Require price through target for fills
     )
     session.started_at = datetime.now()
     session.is_within_trading_hours = lambda: True  # Override for backtesting
@@ -345,6 +350,8 @@ def main():
     parser.add_argument("--contract", type=str, help="Contract symbol (e.g., ESZ5)")
     parser.add_argument("--batch", action="store_true", help="Run batch of predefined dates")
     parser.add_argument("--summary", action="store_true", help="Show spending summary only")
+    parser.add_argument("--conservative", action="store_true",
+                       help="Require price to go 1 tick BEYOND target for fills (simulates queue position)")
 
     args = parser.parse_args()
 
@@ -405,7 +412,8 @@ def main():
                 date=date,
                 start_time=start,
                 end_time=end,
-                budget_remaining=spending["remaining"]
+                budget_remaining=spending["remaining"],
+                conservative_fills=args.conservative
             )
             if result:
                 results.append(result)
@@ -457,7 +465,8 @@ def main():
             date=args.date,
             start_time=args.start,
             end_time=args.end,
-            budget_remaining=budget_remaining
+            budget_remaining=budget_remaining,
+            conservative_fills=args.conservative
         )
         print_summary()
 
