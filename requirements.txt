@@ -23,6 +23,11 @@ pandas-ta>=0.3.14b
 python-dotenv>=1.0.0
 pyyaml>=6.0
 structlog>=23.1.0
+aiohttp>=3.9.0
+pytz>=2024.1
+
+# Rithmic (optional - for live trading)
+async_rithmic>=1.2.0
 
 # Development
 pytest>=7.4.0

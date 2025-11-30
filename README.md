@@ -100,6 +100,76 @@ export DATABENTO_API_KEY=your_key_here
 PYTHONPATH=. python main.py --symbol MES --mode paper
 ```
 
+## Headless Production Deployment
+
+For locked-down servers with no exposed ports. All status via Discord webhooks.
+
+### Quick Deploy
+
+```bash
+# On your server
+git clone <repo> /opt/tradebot
+cd /opt/tradebot
+sudo ./scripts/deploy_headless.sh
+
+# Edit credentials
+sudo nano /opt/tradebot/.env
+
+# Start
+sudo systemctl start tradebot
+```
+
+### Required Environment Variables
+
+```bash
+# Rithmic (for live trading)
+RITHMIC_USER=your_username
+RITHMIC_PASSWORD=your_password
+
+# Discord (required - all status goes here)
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx/yyy
+
+# Trading config
+TRADING_SYMBOL=MES
+DAILY_PROFIT_TARGET=500
+DAILY_LOSS_LIMIT=-300
+```
+
+### What You'll Receive on Discord
+
+| Event | Notification |
+|-------|--------------|
+| System start | Session config and start time |
+| Trade opened | Entry, stop, target prices |
+| Trade closed | P&L and exit reason |
+| Connection lost | Alert with timestamp |
+| Connection restored | Confirmation |
+| Loss limit hit | Session halted alert |
+| Profit target hit | Success notification |
+| 3:55 PM | Auto-flatten notification |
+| 4:00 PM | Full daily digest with stats |
+
+### Service Commands
+
+```bash
+sudo ./scripts/deploy_headless.sh --start    # Start
+sudo ./scripts/deploy_headless.sh --stop     # Stop
+sudo ./scripts/deploy_headless.sh --restart  # Restart
+sudo ./scripts/deploy_headless.sh --logs     # View logs
+sudo ./scripts/deploy_headless.sh --update   # Pull latest & restart
+```
+
+### Health Check (No Port Needed)
+
+Run manually via SSH:
+```bash
+sudo -u tradebot /opt/tradebot/venv/bin/python -c "
+from src.core.persistence import get_persistence
+state = get_persistence().load_state()
+print(state)
+"
+```
+
 ## Command Line Options
 
 ### main.py (Live Trading)
@@ -227,11 +297,16 @@ tradebot/
 │   ├── core/              # Types, constants, config
 │   │   ├── types.py       # Data models (Tick, Signal, FootprintBar)
 │   │   ├── constants.py   # Tick sizes, values, patterns
-│   │   └── config.py      # Configuration management
+│   │   ├── config.py      # Configuration management
+│   │   ├── notifications.py # Discord webhook alerts
+│   │   ├── persistence.py # State save/restore for crash recovery
+│   │   ├── scheduler.py   # Auto-flatten & scheduled tasks
+│   │   └── operations.py  # Headless operations manager
 │   ├── data/
 │   │   ├── adapters/      # Data feed adapters
 │   │   │   ├── polygon.py # Polygon.io historical replay
-│   │   │   └── databento.py # Databento live feed
+│   │   │   ├── databento.py # Databento live feed
+│   │   │   └── rithmic.py # Rithmic live feed (production)
 │   │   └── aggregator.py  # Tick to bar aggregation
 │   ├── analysis/
 │   │   ├── engine.py      # Order flow analysis engine
@@ -251,14 +326,17 @@ tradebot/
 │   │   ├── orders.py      # Order types
 │   │   └── session.py     # Trading session
 │   └── api/
-│       └── server.py      # FastAPI server + WebSocket
+│       └── server.py      # FastAPI server + WebSocket + /health
 ├── scripts/
 │   ├── run_demo.py        # Demo with simulated data
 │   ├── run_replay.py      # Historical replay
-│   └── simulate_trading.py # Trading simulation
+│   ├── deploy_headless.sh # Headless server deployment
+│   ├── preflight_check.py # Pre-production verification
+│   └── tradebot.service   # Systemd service file
 ├── static/                # Dashboard HTML/CSS/JS
 ├── tests/                 # Unit tests
-├── main.py                # CLI entry point
+├── main.py                # CLI entry point (with web dashboard)
+├── run_headless.py        # Headless entry point (no web server)
 ├── requirements.txt       # Python dependencies
 └── pyproject.toml         # Package configuration
 ```

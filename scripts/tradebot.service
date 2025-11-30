@@ -1,0 +1,27 @@
+[Unit]
+Description=Headless Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/tradebot
+Environment="PATH=/opt/tradebot/venv/bin:/usr/bin"
+EnvironmentFile=/opt/tradebot/.env
+ExecStart=/opt/tradebot/venv/bin/python /opt/tradebot/run_headless.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tradebot/data /var/log/tradebot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

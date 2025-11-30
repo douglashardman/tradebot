@@ -21,6 +21,9 @@ from src.execution.orders import Trade, Position
 
 logger = logging.getLogger(__name__)
 
+# Track system start time for uptime calculation
+_system_start_time = datetime.now()
+
 # Get project root for static files
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STATIC_DIR = PROJECT_ROOT / "static"
@@ -31,6 +34,12 @@ execution_manager: Optional[ExecutionManager] = None
 strategy_router: Optional[object] = None  # StrategyRouter instance
 connected_clients: List[WebSocket] = []
 signal_history: List[dict] = []
+
+# Data feed state (set by main.py when adapter is running)
+data_feed_connected: bool = False
+last_tick_time: Optional[datetime] = None
+ticks_today: int = 0
+current_regime: Optional[str] = None
 
 
 # === Pydantic Models ===
@@ -125,8 +134,67 @@ async def dashboard():
 
 @app.get("/")
 async def root():
-    """Health check."""
+    """Basic health check."""
     return {"status": "ok", "service": "Order Flow Trading Dashboard"}
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Detailed health check endpoint.
+
+    Returns system status including:
+    - Feed connection status
+    - Last tick timestamp
+    - Daily statistics
+    - Current position
+    - Uptime
+    """
+    global data_feed_connected, last_tick_time, ticks_today, current_regime
+
+    # Calculate uptime
+    uptime_seconds = (datetime.now() - _system_start_time).total_seconds()
+    hours = int(uptime_seconds // 3600)
+    minutes = int((uptime_seconds % 3600) // 60)
+    uptime_str = f"{hours}h {minutes}m"
+
+    # Get current position status
+    position_str = "FLAT"
+    if execution_manager and execution_manager.open_positions:
+        pos = execution_manager.open_positions[0]
+        position_str = f"{pos.side} {pos.size} @ {pos.entry_price}"
+
+    # Get daily P&L and trades
+    daily_pnl = 0.0
+    trades_today = 0
+    if execution_manager:
+        daily_pnl = execution_manager.daily_pnl
+        trades_today = len(execution_manager.completed_trades)
+
+    # Get regime from router
+    regime_str = current_regime or "UNKNOWN"
+    if strategy_router and hasattr(strategy_router, 'get_state'):
+        router_state = strategy_router.get_state()
+        regime_str = router_state.get("current_regime", "UNKNOWN")
+
+    # Determine overall status
+    status = "healthy"
+    if not data_feed_connected:
+        status = "degraded"
+    if execution_manager and execution_manager.is_halted:
+        status = "halted"
+
+    return {
+        "status": status,
+        "feed_connected": data_feed_connected,
+        "last_tick": last_tick_time.isoformat() if last_tick_time else None,
+        "ticks_today": ticks_today,
+        "position": position_str,
+        "daily_pnl": round(daily_pnl, 2),
+        "trades_today": trades_today,
+        "regime": regime_str,
+        "uptime": uptime_str,
+    }
 
 
 @app.post("/api/session/start")
@@ -561,6 +629,28 @@ def run_server(host: str = "0.0.0.0", port: int = 8000):
     """Run the FastAPI server."""
     import uvicorn
     uvicorn.run(app, host=host, port=port)
+
+
+# === Feed State Helpers ===
+
+def update_feed_state(connected: bool, tick_time: Optional[datetime] = None) -> None:
+    """Update data feed connection state."""
+    global data_feed_connected, last_tick_time
+    data_feed_connected = connected
+    if tick_time:
+        last_tick_time = tick_time
+
+
+def increment_tick_count() -> None:
+    """Increment the daily tick counter."""
+    global ticks_today
+    ticks_today += 1
+
+
+def reset_daily_stats() -> None:
+    """Reset daily counters (call at start of new session)."""
+    global ticks_today
+    ticks_today = 0
 
 
 if __name__ == "__main__":
