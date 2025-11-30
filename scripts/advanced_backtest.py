@@ -68,6 +68,11 @@ class TestConfig:
     stacked_signals_sizing: bool = False   # Double size when 2+ signals in same bar
     pattern_sequence_sizing: bool = False  # ABSORPTION followed by EXHAUSTION = extra conviction
 
+    # Combined strategy options
+    combine_sizing: bool = False           # If True, sizing strategies are ADDITIVE
+    max_position_size: int = 4             # Maximum contracts when combining strategies
+    scaled_loss_limit: bool = False        # Scale daily loss limit with position size
+
     def __str__(self):
         return f"{self.name}: {self.description}"
 
@@ -157,8 +162,43 @@ class AdvancedBacktester:
 
         return sum(trs[-period:]) / period
 
-    def get_position_size(self, atr: float, regime: str, win_streak: int, loss_streak: int) -> int:
-        """Calculate position size based on config."""
+    def get_position_size(self, atr: float, regime: str, win_streak: int, loss_streak: int, stacked_count: int = 1) -> int:
+        """Calculate position size based on config.
+
+        When combine_sizing is True, strategies are ADDITIVE:
+        - Base: 1 contract
+        - Stacked signals (2+): +1 contract
+        - Trending regime: +1 contract
+        - Win streak (3+): +1 contract
+        - Loss streak (2+): -1 contract
+
+        Otherwise, strategies override each other (legacy behavior).
+        """
+        if getattr(self.config, 'combine_sizing', False):
+            # COMBINED mode: strategies are additive
+            size = self.config.base_position_size
+
+            # Stacked signals bonus
+            if self.config.stacked_signals_sizing and stacked_count >= 2:
+                size += 1
+
+            # Regime bonus
+            if self.config.regime_sizing:
+                if regime in ['TRENDING_UP', 'TRENDING_DOWN']:
+                    size += 1
+
+            # Streak adjustment
+            if self.config.streak_sizing:
+                if win_streak >= 3:
+                    size += 1
+                elif loss_streak >= 2:
+                    size -= 1
+
+            # Apply cap
+            max_size = getattr(self.config, 'max_position_size', 4)
+            return max(1, min(size, max_size))
+
+        # LEGACY mode: strategies override each other
         size = self.config.base_position_size
 
         if self.config.volatility_sizing:
@@ -300,15 +340,16 @@ class AdvancedBacktester:
                     regime_state = router.get_state()
                     regime = regime_state.get("current_regime", "UNKNOWN")
 
-                    # Calculate position size
-                    size = self.get_position_size(atr, regime, win_streak, loss_streak)
+                    # Count same-direction signals in this bar
+                    same_direction_count = sum(1 for s in current_bar_signals
+                                               if s['direction'] == signal.direction)
 
-                    # Stacked signals sizing (Test 9)
-                    if self.config.stacked_signals_sizing and len(current_bar_signals) >= 2:
-                        # Check if multiple signals have same direction
-                        same_direction = sum(1 for s in current_bar_signals
-                                           if s['direction'] == signal.direction)
-                        if same_direction >= 2:
+                    # Calculate position size (pass stacked count for combined mode)
+                    size = self.get_position_size(atr, regime, win_streak, loss_streak, same_direction_count)
+
+                    # Stacked signals sizing (Test 9 - legacy mode, not combined)
+                    if self.config.stacked_signals_sizing and not self.config.combine_sizing:
+                        if same_direction_count >= 2:
                             size = min(size * 2, 4)  # Double, cap at 4
 
                     # Pattern sequence sizing (Test 10)
@@ -770,6 +811,476 @@ def run_test_15_rollover_weeks():
     }
 
 
+# Test 16: Combined Strategy Stack
+TEST_16_COMBINED = TestConfig(
+    name="Test 16: Combined Strategy Stack",
+    description="Stacked + Regime + Streak sizing combined (additive)",
+    stacked_signals_sizing=True,
+    regime_sizing=True,
+    streak_sizing=True,
+    combine_sizing=True,
+    max_position_size=4,
+    daily_loss_limit=-500.0,
+    conservative_fills=True,
+)
+
+
+def run_test_16_combined():
+    """
+    Test 16: Combined Strategy Stack.
+
+    Combine all winning strategies to see if they compound or overlap:
+    - Stacked signals: +1 contract when 2+ patterns fire
+    - Regime sizing: +1 contract in TRENDING
+    - Streak sizing: +1 after 3 wins, -1 after 2 losses
+    - Max cap: 4 contracts
+    """
+    print("\n" + "=" * 70)
+    print("TEST 16: Combined Strategy Stack")
+    print("Stacked + Regime + Streak sizing (additive, max 4 contracts)")
+    print("=" * 70)
+
+    tester = AdvancedBacktester(TEST_16_COMBINED)
+    sessions = tester.get_cached_sessions()
+
+    print(f"Running {len(sessions)} days...")
+
+    results = []
+    max_position_used = 0
+    max_daily_loss = 0
+    running_balance = 10000
+    peak_balance = 10000
+    max_drawdown = 0
+
+    for session in sessions:
+        result = tester.run_single_day(session)
+        if result:
+            results.append(result)
+
+            # Track max position used
+            for trade in result.get('trade_details', []):
+                max_position_used = max(max_position_used, trade.get('size', 1))
+
+            # Track max daily loss
+            if result['pnl'] < 0:
+                max_daily_loss = min(max_daily_loss, result['pnl'])
+
+            # Track drawdown
+            running_balance += result['pnl']
+            peak_balance = max(peak_balance, running_balance)
+            current_drawdown = peak_balance - running_balance
+            max_drawdown = max(max_drawdown, current_drawdown)
+
+    # Calculate summary
+    total_pnl = sum(r['pnl'] for r in results)
+    winning_days = sum(1 for r in results if r['pnl'] > 0)
+    losing_days = sum(1 for r in results if r['pnl'] < 0)
+    total_trades = sum(r['trades'] for r in results)
+    total_wins = sum(r['wins'] for r in results)
+    total_losses = sum(r['losses'] for r in results)
+
+    print(f"\n{'='*70}")
+    print("RESULTS: Test 16 - Combined Strategy Stack")
+    print(f"{'='*70}")
+    print(f"Days tested:       {len(results)}")
+    print(f"Total P&L:         ${total_pnl:,.0f}")
+    print(f"Avg Daily P&L:     ${total_pnl/len(results):,.0f}")
+    print(f"Winning days:      {winning_days} ({100*winning_days/len(results):.1f}%)")
+    print(f"Losing days:       {losing_days} ({100*losing_days/len(results):.1f}%)")
+    print(f"Total trades:      {total_trades}")
+    print(f"Trade win rate:    {100*total_wins/(total_wins+total_losses):.1f}%")
+    print(f"\n--- Risk Metrics ---")
+    print(f"Max position used: {max_position_used} contracts")
+    print(f"Max daily loss:    ${max_daily_loss:,.0f}")
+    print(f"Max drawdown:      ${max_drawdown:,.0f}")
+    print(f"Final balance:     ${running_balance:,.0f} (started $10,000)")
+
+    return {
+        'total_pnl': total_pnl,
+        'winning_days': winning_days,
+        'losing_days': losing_days,
+        'max_position_used': max_position_used,
+        'max_daily_loss': max_daily_loss,
+        'max_drawdown': max_drawdown,
+        'results': results,
+    }
+
+
+def run_test_17_scaled_limits():
+    """
+    Test 17: Scaled Loss Limits.
+
+    Scale daily loss limit with position size:
+    - Base limit: $300 per contract allowed
+    - If max 3 contracts that day: $900 limit
+    """
+    print("\n" + "=" * 70)
+    print("TEST 17: Scaled Loss Limits")
+    print("Daily loss limit = $300 × max contracts that day")
+    print("=" * 70)
+
+    # We need to run this manually to track per-day scaling
+    base_config = TestConfig(
+        name="Test 17: Scaled Loss Limits",
+        description="Loss limit scales with position size",
+        stacked_signals_sizing=True,
+        regime_sizing=True,
+        streak_sizing=True,
+        combine_sizing=True,
+        max_position_size=4,
+        conservative_fills=True,
+    )
+
+    tester = AdvancedBacktester(base_config)
+    sessions = tester.get_cached_sessions()
+
+    print(f"Running {len(sessions)} days...")
+
+    # Run Test 16 (fixed $500 limit) for comparison
+    fixed_results = []
+    scaled_results = []
+
+    # For fixed limit
+    fixed_config = TEST_16_COMBINED
+    fixed_tester = AdvancedBacktester(fixed_config)
+
+    # For scaled limit, we'll manually adjust per-day
+    days_hit_fixed = 0
+    days_hit_scaled = 0
+
+    for session in sessions:
+        # Run with fixed $500 limit
+        fixed_result = fixed_tester.run_single_day(session)
+        if fixed_result:
+            fixed_results.append(fixed_result)
+            if fixed_result['pnl'] <= -450:  # Within $50 of limit
+                days_hit_fixed += 1
+
+        # For scaled test, determine max position for day and scale limit
+        # This is approximate - we use the max position from fixed run
+        if fixed_result:
+            max_pos = 1
+            for trade in fixed_result.get('trade_details', []):
+                max_pos = max(max_pos, trade.get('size', 1))
+
+            scaled_limit = -300 * max_pos
+
+            # Create config with scaled limit
+            scaled_config = TestConfig(
+                name="Scaled",
+                description="",
+                stacked_signals_sizing=True,
+                regime_sizing=True,
+                streak_sizing=True,
+                combine_sizing=True,
+                max_position_size=4,
+                daily_loss_limit=scaled_limit,
+                conservative_fills=True,
+            )
+            scaled_tester = AdvancedBacktester(scaled_config)
+            scaled_result = scaled_tester.run_single_day(session)
+            if scaled_result:
+                scaled_results.append(scaled_result)
+                if scaled_result['pnl'] <= scaled_limit + 50:
+                    days_hit_scaled += 1
+
+    # Compare results
+    fixed_pnl = sum(r['pnl'] for r in fixed_results)
+    scaled_pnl = sum(r['pnl'] for r in scaled_results)
+    fixed_wins = sum(1 for r in fixed_results if r['pnl'] > 0)
+    scaled_wins = sum(1 for r in scaled_results if r['pnl'] > 0)
+
+    print(f"\n{'='*70}")
+    print("COMPARISON: Fixed vs Scaled Loss Limits")
+    print(f"{'='*70}")
+    print(f"{'Metric':<25} {'Fixed $500':<15} {'Scaled $300×N':<15}")
+    print("-" * 55)
+    print(f"{'Total P&L':<25} ${fixed_pnl:>13,.0f} ${scaled_pnl:>13,.0f}")
+    print(f"{'Winning Days':<25} {fixed_wins:>13} {scaled_wins:>13}")
+    print(f"{'Days Hit Limit':<25} {days_hit_fixed:>13} {days_hit_scaled:>13}")
+    print(f"{'Difference':<25} {'Baseline':>13} ${scaled_pnl - fixed_pnl:>+12,.0f}")
+
+    return {
+        'fixed_pnl': fixed_pnl,
+        'scaled_pnl': scaled_pnl,
+        'days_hit_fixed': days_hit_fixed,
+        'days_hit_scaled': days_hit_scaled,
+    }
+
+
+def run_test_18_capital_simulation():
+    """
+    Test 18: Capital Simulation.
+
+    Starting with $2,500, simulate account growth with tier-based sizing:
+    - $2,500-$5,000: 1 MES ($50 daily limit)
+    - $5,000-$10,000: 1 ES ($500 daily limit)
+    - $10,000-$20,000: 2 ES ($1,000 daily limit)
+    - $20,000-$40,000: 3 ES ($1,500 daily limit)
+    - $40,000+: 4 ES ($2,000 daily limit)
+    """
+    print("\n" + "=" * 70)
+    print("TEST 18: Capital Simulation")
+    print("Starting balance: $2,500 with tier-based position sizing")
+    print("=" * 70)
+
+    # MES = 1/10 of ES, so we'll scale P&L by 0.1 for MES trades
+    tiers = [
+        {'min': 0, 'max': 5000, 'contracts': 1, 'is_mes': True, 'limit': 50},      # Under $5K = MES
+        {'min': 5000, 'max': 10000, 'contracts': 1, 'is_mes': False, 'limit': 500},
+        {'min': 10000, 'max': 20000, 'contracts': 2, 'is_mes': False, 'limit': 1000},
+        {'min': 20000, 'max': 40000, 'contracts': 3, 'is_mes': False, 'limit': 1500},
+        {'min': 40000, 'max': float('inf'), 'contracts': 4, 'is_mes': False, 'limit': 2000},
+    ]
+
+    def get_tier(balance):
+        for tier in tiers:
+            if tier['min'] <= balance < tier['max']:
+                return tier
+        return tiers[-1]  # Max tier for very high balances
+
+    # Get baseline results for reference (1 ES contract)
+    baseline_tester = AdvancedBacktester(TEST_16_COMBINED)
+    sessions = baseline_tester.get_cached_sessions()
+
+    print(f"Simulating {len(sessions)} days...")
+
+    balance = 2500
+    peak_balance = balance
+    max_drawdown = 0
+    max_drawdown_pct = 0
+    tier_transitions = []
+    current_tier_idx = 0
+
+    daily_log = []
+
+    for session in sessions:
+        tier = get_tier(balance)
+        tier_idx = tiers.index(tier)
+
+        # Track tier transitions
+        if tier_idx != current_tier_idx:
+            tier_transitions.append({
+                'date': session['date'],
+                'from_tier': current_tier_idx,
+                'to_tier': tier_idx,
+                'balance': balance,
+            })
+            current_tier_idx = tier_idx
+
+        # Run backtest with appropriate sizing
+        config = TestConfig(
+            name="Tier",
+            description="",
+            stacked_signals_sizing=True,
+            regime_sizing=True,
+            streak_sizing=True,
+            combine_sizing=True,
+            max_position_size=tier['contracts'],
+            daily_loss_limit=-tier['limit'],
+            conservative_fills=True,
+        )
+        tester = AdvancedBacktester(config)
+        result = tester.run_single_day(session)
+
+        if result:
+            # Scale P&L for MES
+            pnl = result['pnl']
+            if tier['is_mes']:
+                pnl = pnl * 0.1  # MES is 1/10 of ES
+
+            balance += pnl
+            peak_balance = max(peak_balance, balance)
+            drawdown = peak_balance - balance
+            max_drawdown = max(max_drawdown, drawdown)
+            if peak_balance > 0:
+                dd_pct = drawdown / peak_balance * 100
+                max_drawdown_pct = max(max_drawdown_pct, dd_pct)
+
+            daily_log.append({
+                'date': session['date'],
+                'pnl': pnl,
+                'balance': balance,
+                'tier': tier_idx,
+                'contracts': tier['contracts'],
+                'is_mes': tier['is_mes'],
+            })
+
+    # Find days to reach each tier
+    tier_reached = {}
+    for i, log in enumerate(daily_log):
+        if log['tier'] not in tier_reached:
+            tier_reached[log['tier']] = {'day': i + 1, 'date': log['date']}
+
+    print(f"\n{'='*70}")
+    print("RESULTS: Capital Simulation")
+    print(f"{'='*70}")
+    print(f"Starting balance:  $2,500")
+    print(f"Ending balance:    ${balance:,.0f}")
+    print(f"Total gain:        ${balance - 2500:,.0f} ({(balance/2500 - 1)*100:.0f}%)")
+    print(f"Peak balance:      ${peak_balance:,.0f}")
+    print(f"Max drawdown:      ${max_drawdown:,.0f} ({max_drawdown_pct:.1f}%)")
+
+    print(f"\n--- Tier Progression ---")
+    tier_names = ['MES (1)', 'ES (1)', 'ES (2)', 'ES (3)', 'ES (4)']
+    for tier_idx, info in sorted(tier_reached.items()):
+        print(f"  {tier_names[tier_idx]:<10}: Day {info['day']:3d} ({info['date']})")
+
+    print(f"\n--- Tier Transitions ---")
+    for t in tier_transitions:
+        direction = "↑" if t['to_tier'] > t['from_tier'] else "↓"
+        print(f"  {t['date']}: {tier_names[t['from_tier']]} → {tier_names[t['to_tier']]} {direction} (${t['balance']:,.0f})")
+
+    # Check if we ever dropped a tier
+    dropped_tiers = [t for t in tier_transitions if t['to_tier'] < t['from_tier']]
+    if dropped_tiers:
+        print(f"\n⚠️  Account dropped tier {len(dropped_tiers)} time(s)")
+    else:
+        print(f"\n✓ Account never dropped a tier")
+
+    return {
+        'starting_balance': 2500,
+        'ending_balance': balance,
+        'max_drawdown': max_drawdown,
+        'max_drawdown_pct': max_drawdown_pct,
+        'tier_transitions': tier_transitions,
+        'tier_reached': tier_reached,
+        'daily_log': daily_log,
+    }
+
+
+def run_test_19_worst_case():
+    """
+    Test 19: Worst Case Stress Test.
+
+    Find the worst 5-day stretch and simulate starting on day 1 of that stretch
+    with $2,500 account using tier-based sizing.
+    """
+    print("\n" + "=" * 70)
+    print("TEST 19: Worst Case Stress Test")
+    print("What if we started on the worst possible day?")
+    print("=" * 70)
+
+    # First, run baseline to find worst 5-day stretch
+    baseline_tester = AdvancedBacktester(BASELINE)
+    sessions = baseline_tester.get_cached_sessions()
+
+    print(f"Analyzing {len(sessions)} days to find worst 5-day stretch...")
+
+    # Get all daily P&Ls
+    daily_pnls = []
+    for session in sessions:
+        result = baseline_tester.run_single_day(session)
+        if result:
+            daily_pnls.append({'date': session['date'], 'pnl': result['pnl'], 'session': session})
+
+    # Find worst 5-day window
+    worst_window_start = 0
+    worst_window_pnl = float('inf')
+
+    for i in range(len(daily_pnls) - 4):
+        window_pnl = sum(d['pnl'] for d in daily_pnls[i:i+5])
+        if window_pnl < worst_window_pnl:
+            worst_window_pnl = window_pnl
+            worst_window_start = i
+
+    worst_5_days = daily_pnls[worst_window_start:worst_window_start+5]
+
+    print(f"\n--- Worst 5-Day Stretch ---")
+    print(f"Dates: {worst_5_days[0]['date']} to {worst_5_days[-1]['date']}")
+    print(f"Combined P&L: ${worst_window_pnl:,.0f}")
+    for d in worst_5_days:
+        print(f"  {d['date']}: ${d['pnl']:+,.0f}")
+
+    # Now simulate starting on this day with $2,500
+    print(f"\n--- Simulation: Starting ${2500:,} on {worst_5_days[0]['date']} ---")
+
+    # Reorder sessions to start from worst day
+    reordered_sessions = [d['session'] for d in daily_pnls[worst_window_start:]]
+    reordered_sessions.extend([d['session'] for d in daily_pnls[:worst_window_start]])
+
+    # Use tier-based sizing from Test 18
+    tiers = [
+        {'min': 0, 'max': 5000, 'contracts': 1, 'is_mes': True, 'limit': 50},      # Under $5K = MES
+        {'min': 5000, 'max': 10000, 'contracts': 1, 'is_mes': False, 'limit': 500},
+        {'min': 10000, 'max': 20000, 'contracts': 2, 'is_mes': False, 'limit': 1000},
+        {'min': 20000, 'max': float('inf'), 'contracts': 4, 'is_mes': False, 'limit': 2000},
+    ]
+
+    def get_tier(balance):
+        if balance <= 0:
+            return {'contracts': 0, 'is_mes': True, 'limit': 0}  # Wiped out
+        for tier in tiers:
+            if tier['min'] <= balance < tier['max']:
+                return tier
+        return tiers[-1]
+
+    balance = 2500
+    lowest_balance = balance
+    lowest_date = worst_5_days[0]['date']
+    survived = True
+    recovery_day = None
+
+    for i, session in enumerate(reordered_sessions[:30]):  # First 30 days
+        tier = get_tier(balance)
+
+        if tier['contracts'] == 0:
+            print(f"  💀 ACCOUNT WIPED OUT on day {i+1}")
+            survived = False
+            break
+
+        config = TestConfig(
+            name="Stress",
+            description="",
+            stacked_signals_sizing=True,
+            regime_sizing=True,
+            streak_sizing=True,
+            combine_sizing=True,
+            max_position_size=tier['contracts'],
+            daily_loss_limit=-tier['limit'],
+            conservative_fills=True,
+        )
+        tester = AdvancedBacktester(config)
+        result = tester.run_single_day(session)
+
+        if result:
+            pnl = result['pnl']
+            if tier['is_mes']:
+                pnl = pnl * 0.1
+
+            balance += pnl
+
+            if balance < lowest_balance:
+                lowest_balance = balance
+                lowest_date = session['date']
+
+            status = "WIN" if pnl > 0 else "LOSS"
+            tier_name = "MES" if tier['is_mes'] else f"ES×{tier['contracts']}"
+            print(f"  Day {i+1:2d} ({session['date']}): ${pnl:+6,.0f} [{status}] → ${balance:,.0f} ({tier_name})")
+
+            # Check if recovered past starting balance
+            if recovery_day is None and balance >= 2500 and i > 0:
+                recovery_day = i + 1
+
+    print(f"\n{'='*70}")
+    print("FINDINGS")
+    print(f"{'='*70}")
+    print(f"Survived worst stretch: {'YES ✓' if survived else 'NO ✗'}")
+    print(f"Lowest balance:         ${lowest_balance:,.0f} on {lowest_date}")
+    print(f"Max drawdown:           ${2500 - lowest_balance:,.0f} ({(1 - lowest_balance/2500)*100:.1f}%)")
+    if recovery_day:
+        print(f"Days to recover:        {recovery_day}")
+    else:
+        print(f"Days to recover:        Did not recover in 30 days" if survived else "N/A")
+
+    return {
+        'worst_5_days': worst_5_days,
+        'survived': survived,
+        'lowest_balance': lowest_balance,
+        'recovery_day': recovery_day,
+    }
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -807,6 +1318,14 @@ if __name__ == "__main__":
             run_test_14_monday_after_friday()
         elif args.test == 15:
             run_test_15_rollover_weeks()
+        elif args.test == 16:
+            run_test_16_combined()
+        elif args.test == 17:
+            run_test_17_scaled_limits()
+        elif args.test == 18:
+            run_test_18_capital_simulation()
+        elif args.test == 19:
+            run_test_19_worst_case()
         else:
             print(f"Unknown test number: {args.test}")
     elif args.all:

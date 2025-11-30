@@ -14,6 +14,23 @@ This document tracks all backtesting experiments, parameters, results, and actio
 1. [Test 1: Original 110-Day Backtest (Optimistic Fills)](#test-1-original-110-day-backtest-optimistic-fills)
 2. [Test 2: Conservative Fills (Queue Position Simulation)](#test-2-conservative-fills-queue-position-simulation)
 3. [Test 3: Daily Loss Limit Comparison ($300 vs $400 vs $500)](#test-3-daily-loss-limit-comparison)
+4. [Test 4: Volatility-Based Position Sizing](#test-4-volatility-based-position-sizing)
+5. [Test 5: Regime-Based Position Sizing](#test-5-regime-based-position-sizing)
+6. [Test 6: Win Streak Position Sizing](#test-6-win-streak-position-sizing)
+7. [Test 7: First Hour Loss Stop](#test-7-first-hour-loss-stop)
+8. [Test 8: Trade Count Limits](#test-8-trade-count-limits)
+9. [Test 9: Stacked Signals](#test-9-stacked-signals)
+10. [Test 10: Pattern Sequences](#test-10-pattern-sequences)
+11. [Test 11: First Hour Only](#test-11-first-hour-only)
+12. [Test 12: Skip First 30 Minutes](#test-12-skip-first-30-minutes)
+13. [Test 13: Afternoon Only](#test-13-afternoon-only)
+14. [Test 14: Monday After Big Friday](#test-14-monday-after-big-friday)
+15. [Test 15: Contract Rollover Weeks](#test-15-contract-rollover-weeks)
+16. [Test 16: Combined Strategy Stack](#test-16-combined-strategy-stack)
+17. [Test 17: Scaled Loss Limits](#test-17-scaled-loss-limits)
+18. [Test 18: Capital Simulation](#test-18-capital-simulation)
+19. [Test 19: Worst Case Stress Test](#test-19-worst-case-stress-test)
+20. [Results Summary (All Tests)](#results-summary-all-tests)
 
 ---
 
@@ -565,12 +582,191 @@ ES futures rollover week (third week of Mar/Jun/Sep/Dec) may have different beha
 
 ---
 
+## Test 16: Combined Strategy Stack
+
+**Date Run**: November 30, 2025
+**Script**: `scripts/advanced_backtest.py --test 16`
+
+### Hypothesis
+
+Combine all winning strategies additively to see if they compound:
+- Base: 1 contract
+- Stacked signals (2+): +1 contract
+- Trending regime: +1 contract
+- Win streak (3+): +1 contract
+- Loss streak (2+): -1 contract
+- Max cap: 4 contracts
+
+### Results
+
+| Metric | Baseline | Combined | Change |
+|--------|----------|----------|--------|
+| Total P&L | $190,700 | **$416,500** | **+$225,800 (+118.4%)** |
+| Winning Days | 100 (90.9%) | 88 (80.0%) | -12 |
+| Losing Days | 7 | 18 | +11 |
+| Trade Win Rate | 69.6% | 69.7% | Same |
+| Total Trades | 1,339 | 1,230 | -109 |
+
+### Risk Metrics
+
+| Metric | Value |
+|--------|-------|
+| Max position used | 4 contracts |
+| Max daily loss | $-1,000 |
+| Max drawdown | $1,400 |
+| Final balance | $426,500 (started $10,000) |
+
+### Finding
+
+**MASSIVE WINNER.** Combined strategies more than double the P&L (+118%). The strategies compound rather than overlap. However, max daily loss of $1,000 exceeds the $500 limit with larger positions.
+
+---
+
+## Test 17: Scaled Loss Limits
+
+**Date Run**: November 30, 2025
+**Script**: `scripts/advanced_backtest.py --test 17`
+
+### Hypothesis
+
+With larger positions, the $500 daily loss limit may get hit too fast. Scale the limit with position size: $300 × max contracts.
+
+### Parameters
+
+| Position Size | Fixed Limit | Scaled Limit |
+|---------------|-------------|--------------|
+| 1 contract | $500 | $300 |
+| 2 contracts | $500 | $600 |
+| 3 contracts | $500 | $900 |
+| 4 contracts | $500 | $1,200 |
+
+### Results
+
+| Metric | Fixed $500 | Scaled $300×N |
+|--------|------------|---------------|
+| Total P&L | $416,500 | **$432,800** |
+| Winning Days | 88 | 92 |
+| Days Hit Limit | 17 | 13 |
+| Difference | Baseline | **+$16,300** |
+
+### Finding
+
+**WINNER.** Scaled limits improve returns by $16,300 and reduce days hitting the limit from 17 to 13. Larger positions need proportionally larger breathing room.
+
+---
+
+## Test 18: Capital Simulation
+
+**Date Run**: November 30, 2025
+**Script**: `scripts/advanced_backtest.py --test 18`
+
+### Hypothesis
+
+Starting with $2,500, simulate realistic account growth with tier-based position sizing.
+
+### Position Sizing Tiers
+
+| Account Balance | Instrument | Max Contracts | Daily Loss Limit |
+|----------------|------------|---------------|------------------|
+| $0 - $5,000 | MES | 1 | $50 |
+| $5,000 - $10,000 | ES | 1 | $500 |
+| $10,000 - $20,000 | ES | 2 | $1,000 |
+| $20,000 - $40,000 | ES | 3 | $1,500 |
+| $40,000+ | ES | 4 | $2,000 |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Starting Balance | $2,500 |
+| Ending Balance | **$351,080** |
+| Total Gain | $348,580 (**+13,943%**) |
+| Peak Balance | $351,680 |
+| Max Drawdown | $1,100 (6.1%) |
+
+### Tier Progression
+
+| Tier | Day Reached | Date | Balance |
+|------|-------------|------|---------|
+| MES (1) | Day 1 | 2025-07-01 | $2,500 |
+| ES (1) | Day 38 | 2025-08-21 | $5,280 |
+| ES (2) | Day 44 | 2025-08-29 | $10,480 |
+| ES (3) | Day 48 | 2025-09-04 | $20,480 |
+| ES (4) | Day 59 | 2025-09-19 | $44,880 |
+
+### Finding
+
+**Account never dropped a tier.** Starting with $2,500 trading MES, the account grew to $351,080 in 110 days with max drawdown of only 6.1%. The tier system provides natural risk management.
+
+---
+
+## Test 19: Worst Case Stress Test
+
+**Date Run**: November 30, 2025
+**Script**: `scripts/advanced_backtest.py --test 19`
+
+### Hypothesis
+
+What if we started trading on the worst possible day? Would a $2,500 account survive?
+
+### Worst 5-Day Stretch Identified
+
+| Date | P&L |
+|------|-----|
+| 2025-07-01 | $-500 |
+| 2025-07-02 | $-100 |
+| 2025-07-03 | $+100 |
+| 2025-07-04 | $+300 |
+| 2025-07-07 | $+1,900 |
+| **Total** | **$+1,700** |
+
+**Note**: Even the worst 5-day stretch is NET POSITIVE (+$1,700)! The system is so profitable that consecutive losing days still result in overall gains.
+
+### Simulation Results (Starting on Worst Day)
+
+| Metric | Value |
+|--------|-------|
+| Starting Balance | $2,500 |
+| Lowest Balance | $2,460 (Day 2) |
+| Max Drawdown | $40 (1.6%) |
+| Days to Recover | 4 |
+| Balance at Day 30 | $4,530 |
+| **Survived** | **YES** |
+
+### Daily Log (First 10 Days)
+
+| Day | Date | P&L | Balance | Instrument |
+|-----|------|-----|---------|------------|
+| 1 | 2025-07-01 | $-20 | $2,480 | MES |
+| 2 | 2025-07-02 | $-20 | $2,460 | MES |
+| 3 | 2025-07-03 | $+10 | $2,470 | MES |
+| 4 | 2025-07-04 | $+30 | $2,500 | MES |
+| 5 | 2025-07-07 | $+190 | $2,690 | MES |
+| 6 | 2025-07-08 | $+110 | $2,800 | MES |
+| 7 | 2025-07-09 | $+130 | $2,930 | MES |
+| 8 | 2025-07-10 | $+80 | $3,010 | MES |
+| 9 | 2025-07-11 | $+100 | $3,110 | MES |
+| 10 | 2025-07-14 | $+50 | $3,160 | MES |
+
+### Finding
+
+**ROBUST.** Even starting on the absolute worst day with a $2,500 account trading MES:
+- Max drawdown was only 1.6% ($40)
+- Account recovered within 4 days
+- By day 30, account had grown to $4,530 (+81%)
+
+The combination of MES sizing and the system's edge makes it extremely resilient.
+
+---
+
 ## Results Summary (All Tests)
 
 | Test | Total P&L | vs Baseline | Verdict |
 |------|-----------|-------------|---------|
 | **Baseline** | $190,700 | - | Reference |
-| **9: Stacked Signals** | $309,400 | **+62.2%** | **NEW BEST** |
+| **17: Scaled Loss Limits** | $432,800 | **+126.9%** | **BEST** |
+| **16: Combined Stack** | $416,500 | +118.4% | Winner |
+| **9: Stacked Signals** | $309,400 | +62.2% | Winner |
 | **5: Regime Sizing** | $281,900 | +47.8% | Winner |
 | **4: Volatility Sizing** | $228,300 | +19.7% | Winner |
 | **6: Streak Sizing** | $228,800 | +20.0% | Winner |
@@ -584,24 +780,39 @@ ES futures rollover week (third week of Mar/Jun/Sep/Dec) may have different beha
 
 ### Key Findings
 
-1. **Stacked signals is the NEW biggest lever** (+62.2%) - surpasses regime sizing!
-2. **Regime-based sizing** remains excellent (+47.8%)
-3. **All position sizing strategies help** (volatility, regime, streak, stacked)
-4. **Pattern sequences provide modest improvement** (+7.5%)
-5. **Don't limit trades** - let the system trade freely
-6. **Trade all day** - first hour is best quality, but every period contributes
-7. **Don't stop early** - the system recovers from early losses
-8. **Momentum continues** - big Fridays predict big Mondays (88% win rate)
-9. **Rollover weeks are profitable** but underperform normal weeks
+1. **Combined strategies + scaled limits is the ultimate setup** (+126.9%)
+2. **Strategies COMPOUND rather than overlap** - combining stacked+regime+streak more than doubles returns
+3. **Scale loss limits with position size** ($300 × contracts) - reduces days hitting limits
+4. **$2,500 → $351,080 in 110 days** is achievable with tier-based sizing
+5. **Even the worst 5-day stretch is net positive** (+$1,700) - system has strong edge
+6. **Account never dropped a tier** in capital simulation - smooth growth
+7. **Don't limit trades** - let the system trade freely
+8. **Trade all day** - first hour is best quality, but every period contributes
+9. **Momentum continues** - big Fridays predict big Mondays (88% win rate)
 
-### Recommended Strategy Stack
+### Recommended Strategy Stack (Final)
 
-For maximum performance, consider combining:
-1. **Stacked signals sizing** (when 2+ patterns fire)
-2. **Regime-based sizing** (trending = more contracts)
-3. **Full day trading** (no time restrictions)
-4. **Unlimited trades** (no caps)
-5. **Normal trading on Mondays** (even after big Fridays)
+For maximum performance with proper risk management:
+
+| Component | Setting | Rationale |
+|-----------|---------|-----------|
+| Stacked signals | +1 contract when 2+ patterns | High conviction setups |
+| Regime sizing | +1 contract in TRENDING | Higher win rate in trends |
+| Streak sizing | +1 after 3 wins, -1 after 2 losses | Momentum matters |
+| Max position | 4 contracts | Risk cap |
+| Loss limit | $300 × max contracts | Scaled for position size |
+| Time restrictions | None | Trade all day |
+| Trade limits | Unlimited | More trades = more profit |
+
+### Tier-Based Capital Growth
+
+| Account Balance | Instrument | Contracts | Daily Limit |
+|----------------|------------|-----------|-------------|
+| $0 - $5,000 | MES | 1 | $50 |
+| $5,000 - $10,000 | ES | 1 | $500 |
+| $10,000 - $20,000 | ES | 2 | $1,000 |
+| $20,000 - $40,000 | ES | 3 | $1,500 |
+| $40,000+ | ES | 4 | $2,000 |
 
 ---
 
