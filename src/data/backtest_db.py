@@ -68,14 +68,16 @@ def log_backtest(
     wins: int = 0,
     losses: int = 0,
     pnl: float = 0,
-    notes: str = None
+    notes: str = None,
+    from_cache: bool = False
 ) -> int:
     """
     Log a backtest run to the database.
 
     Cost estimate: ~$0.0016 per 1000 ticks ($1.60 per million)
+    If from_cache=True, don't log to spending table (data was free).
     """
-    estimated_cost = (ticks / 1_000_000) * 1.60  # ~$1.60 per million ticks
+    estimated_cost = 0 if from_cache else (ticks / 1_000_000) * 1.60
     win_rate = wins / trades if trades > 0 else 0
 
     conn = get_connection()
@@ -93,11 +95,12 @@ def log_backtest(
 
     backtest_id = cursor.lastrowid
 
-    # Also log to spending table
-    conn.execute("""
-        INSERT INTO spending (backtest_id, ticks, estimated_cost, description)
-        VALUES (?, ?, ?, ?)
-    """, (backtest_id, ticks, estimated_cost, f"{contract} {date} {start_time}-{end_time}"))
+    # Only log to spending table if not from cache
+    if not from_cache:
+        conn.execute("""
+            INSERT INTO spending (backtest_id, ticks, estimated_cost, description)
+            VALUES (?, ?, ?, ?)
+        """, (backtest_id, ticks, estimated_cost, f"{contract} {date} {start_time}-{end_time}"))
 
     conn.commit()
     conn.close()

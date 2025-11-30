@@ -3,9 +3,11 @@
 Backtest using Databento ES futures tick data.
 
 Tracks spending against budget and logs results to SQLite database.
+Caches tick data locally to avoid re-downloading.
 """
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, time
@@ -17,6 +19,55 @@ from src.analysis.engine import OrderFlowEngine
 from src.regime.router import StrategyRouter
 from src.execution.manager import ExecutionManager
 from src.execution.session import TradingSession
+
+# Cache directory for tick data
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "../data/tick_cache")
+
+
+def get_cache_path(contract: str, date: str, start_time: str, end_time: str) -> str:
+    """Generate cache file path for a session."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    safe_start = start_time.replace(":", "")
+    safe_end = end_time.replace(":", "")
+    return os.path.join(CACHE_DIR, f"{contract}_{date}_{safe_start}_{safe_end}.json")
+
+
+def load_cached_ticks(cache_path: str) -> list:
+    """Load ticks from cache file if it exists."""
+    if not os.path.exists(cache_path):
+        return None
+
+    print(f"Loading from cache: {cache_path}")
+    with open(cache_path) as f:
+        data = json.load(f)
+
+    ticks = []
+    for d in data:
+        ticks.append(Tick(
+            timestamp=datetime.fromisoformat(d["timestamp"]),
+            price=d["price"],
+            volume=d["volume"],
+            side=d["side"],
+            symbol=d["symbol"]
+        ))
+    return ticks
+
+
+def save_ticks_to_cache(ticks: list, cache_path: str) -> None:
+    """Save ticks to cache file."""
+    data = [
+        {
+            "timestamp": t.timestamp.isoformat(),
+            "price": t.price,
+            "volume": t.volume,
+            "side": t.side,
+            "symbol": t.symbol
+        }
+        for t in ticks
+    ]
+    with open(cache_path, "w") as f:
+        json.dump(data, f)
+    print(f"Cached {len(ticks):,} ticks to: {cache_path}")
 
 
 def run_backtest(
@@ -53,20 +104,32 @@ def run_backtest(
     # Determine symbol from contract
     symbol = contract[:2] if contract[:3] not in ["MES", "MNQ"] else contract[:3]
 
-    # Fetch data
-    adapter = DatabentoAdapter()
-    ticks = adapter.get_session_ticks(
-        contract=contract,
-        date=date,
-        start_time=start_time,
-        end_time=end_time
-    )
+    # Check cache first
+    cache_path = get_cache_path(contract, date, start_time, end_time)
+    ticks = load_cached_ticks(cache_path)
+    from_cache = False
 
-    if not ticks:
-        print("No data returned")
-        return None
+    if ticks:
+        print(f"Loaded {len(ticks):,} ticks from cache (FREE - no Databento cost)")
+        from_cache = True
+    else:
+        # Fetch from Databento
+        adapter = DatabentoAdapter()
+        ticks = adapter.get_session_ticks(
+            contract=contract,
+            date=date,
+            start_time=start_time,
+            end_time=end_time
+        )
 
-    print(f"Fetched {len(ticks):,} ticks")
+        if not ticks:
+            print("No data returned")
+            return None
+
+        print(f"Fetched {len(ticks):,} ticks from Databento")
+
+        # Cache for future use
+        save_ticks_to_cache(ticks, cache_path)
 
     # Setup components
     engine = OrderFlowEngine({
@@ -163,7 +226,7 @@ def run_backtest(
         "pnl": pnl,
     }
 
-    # Log to database
+    # Log to database (from_cache=True means no spending logged)
     log_backtest(
         symbol=symbol,
         contract=contract,
@@ -176,7 +239,8 @@ def run_backtest(
         trades=len(trades),
         wins=wins,
         losses=losses,
-        pnl=pnl
+        pnl=pnl,
+        from_cache=from_cache
     )
 
     print(f"\nResults:")
