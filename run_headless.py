@@ -27,7 +27,7 @@ import os
 import signal
 import sys
 from datetime import datetime, time, timedelta
-from typing import Optional
+from typing import List, Optional
 
 import pytz
 
@@ -51,6 +51,24 @@ from src.core.scheduler import (
     get_market_close_time,
     is_trading_day,
     is_market_holiday,
+)
+from src.core.capital import (
+    TierManager,
+    initialize_tier_manager,
+    get_tier_manager,
+    TIERS,
+)
+from src.data.live_db import (
+    create_session as db_create_session,
+    end_session as db_end_session,
+    log_order as db_log_order,
+    update_order_filled as db_update_order_filled,
+    update_order_rejected as db_update_order_rejected,
+    log_trade as db_log_trade,
+    update_trade_exit as db_update_trade_exit,
+    log_tier_change as db_log_tier_change,
+    log_connection_event as db_log_connection,
+    log_account_snapshot as db_log_snapshot,
 )
 
 # Configure logging
@@ -103,12 +121,22 @@ class HeadlessTradingSystem:
         self.notifications: Optional[NotificationService] = None
         self.persistence: Optional[StatePersistence] = None
         self.scheduler: Optional[TradingScheduler] = None
+        self.tier_manager: Optional[TierManager] = None
 
         # State
         self._running = False
         self._tick_count = 0
         self._session_start_time: Optional[datetime] = None
-        self._starting_balance: float = 10000.0
+        self._starting_balance: float = 2500.0  # Starting capital
+        self._current_bar_signals: List[Signal] = []  # Track signals per bar for stacking
+        self._balance_poll_task: Optional[asyncio.Task] = None
+
+        # Database tracking
+        self._db_session_id: Optional[int] = None
+        self._trade_count: int = 0
+        self._pending_trade_context: dict = {}  # Context for trade being opened
+        self._open_trade_ids: dict = {}  # bracket_id -> db trade id
+        self._total_commissions: float = 0.0
 
     async def setup(self) -> bool:
         """Initialize all components."""
@@ -148,19 +176,37 @@ class HeadlessTradingSystem:
             )
             return False
 
-        # Create trading session
+        # Initialize tier manager for capital progression
+        starting_balance = float(os.getenv("STARTING_BALANCE", "2500"))
+        self.tier_manager = initialize_tier_manager(
+            starting_balance=starting_balance,
+            on_tier_change=lambda change: asyncio.create_task(self._on_tier_change(change)),
+        )
+
+        # Start session and get tier-based settings
+        tier_config = self.tier_manager.start_session()
+        self.symbol = tier_config["instrument"]  # MES or ES based on tier
+        self._starting_balance = tier_config["balance"]
+
+        logger.info(f"Tier: {tier_config['tier_name']}")
+        logger.info(f"Instrument: {tier_config['instrument']}")
+        logger.info(f"Max contracts: {tier_config['max_contracts']}")
+        logger.info(f"Loss limit: ${abs(tier_config['daily_loss_limit'])}")
+        logger.info(f"Balance: ${tier_config['balance']:,.2f}")
+
+        # Create trading session with tier-based settings
         self.session = TradingSession(
             mode=self.mode,
             symbol=self.symbol,
             daily_profit_target=float(os.getenv("DAILY_PROFIT_TARGET", "500")),
-            daily_loss_limit=float(os.getenv("DAILY_LOSS_LIMIT", "-300")),
-            max_position_size=int(os.getenv("MAX_POSITION_SIZE", "1")),
+            daily_loss_limit=tier_config["daily_loss_limit"],
+            max_position_size=tier_config["max_contracts"],
             stop_loss_ticks=int(os.getenv("STOP_LOSS_TICKS", "16")),
             take_profit_ticks=int(os.getenv("TAKE_PROFIT_TICKS", "24")),
+            paper_starting_balance=tier_config["balance"],
         )
         self.session.started_at = datetime.now()
         self._session_start_time = datetime.now()
-        self._starting_balance = self.session.paper_starting_balance
 
         # Create execution manager
         self.manager = ExecutionManager(self.session)
@@ -168,6 +214,22 @@ class HeadlessTradingSystem:
         # Wire up trade callbacks for Discord alerts
         self.manager.on_trade(self._on_trade_complete)
         self.manager.on_position(self._on_position_opened)
+
+        # Create database session for logging
+        today = datetime.now().strftime("%Y-%m-%d")
+        self._db_session_id = db_create_session(
+            date=today,
+            mode=self.mode,
+            symbol=self.symbol,
+            tier_index=tier_config.get("tier_index", 0),
+            tier_name=tier_config.get("tier_name"),
+            starting_balance=tier_config["balance"],
+            max_position_size=tier_config["max_contracts"],
+            stop_loss_ticks=self.session.stop_loss_ticks,
+            take_profit_ticks=self.session.take_profit_ticks,
+            daily_loss_limit=tier_config["daily_loss_limit"],
+        )
+        logger.info(f"Created database session #{self._db_session_id}")
 
         # Create order flow engine
         self.engine = OrderFlowEngine({
@@ -306,10 +368,20 @@ class HeadlessTradingSystem:
         # Wait for market open
         await self._wait_for_market_open()
 
-        # Send startup notification
+        # Send startup notification with tier info
+        tier_info = self.tier_manager.get_status() if self.tier_manager else None
+        tier_msg = ""
+        if tier_info:
+            tier_msg = (
+                f"**Tier:** {tier_info['tier_name']}\n"
+                f"**Balance:** ${tier_info['balance']:,.2f}\n"
+                f"**Win Streak:** {tier_info['win_streak']} | **Loss Streak:** {tier_info['loss_streak']}\n\n"
+            )
+
         await self.notifications.send_alert(
             title="Trading Session Started",
             message=(
+                f"{tier_msg}"
                 f"**Symbol:** {self.symbol}\n"
                 f"**Mode:** {self.mode}\n"
                 f"**Profit Target:** ${self.session.daily_profit_target:,.0f}\n"
@@ -321,6 +393,10 @@ class HeadlessTradingSystem:
 
         # Start scheduler
         self.scheduler.start()
+
+        # Start balance polling if using Rithmic
+        if os.getenv("USE_RITHMIC", "true").lower() == "true":
+            self._balance_poll_task = asyncio.create_task(self._poll_balance_loop())
 
         # Main loop
         self._running = True
@@ -380,6 +456,14 @@ class HeadlessTradingSystem:
         logger.info("Shutting down...")
         self._running = False
 
+        # Cancel balance polling
+        if self._balance_poll_task:
+            self._balance_poll_task.cancel()
+            try:
+                await self._balance_poll_task
+            except asyncio.CancelledError:
+                pass
+
         # Stop scheduler
         if self.scheduler:
             self.scheduler.stop()
@@ -387,6 +471,39 @@ class HeadlessTradingSystem:
         # Flatten any open positions
         if self.manager and self.manager.open_positions:
             await self._auto_flatten()
+
+        # End tier session and save state
+        if self.tier_manager and self.manager:
+            session_result = self.tier_manager.end_session(self.manager.daily_pnl)
+            if session_result.get("tier_changed"):
+                logger.info(
+                    f"Session ended with tier change to {session_result['new_tier']}"
+                )
+
+        # End database session
+        if self._db_session_id and self.manager:
+            stats = self.manager.get_statistics()
+            state = self.manager.get_state()
+            ending_balance = self.tier_manager.state.balance if self.tier_manager else self._starting_balance + self.manager.daily_pnl
+
+            status = "COMPLETED"
+            halted_reason = None
+            if self.manager.is_halted:
+                status = "HALTED"
+                halted_reason = self.manager.halt_reason
+
+            db_end_session(
+                session_id=self._db_session_id,
+                ending_balance=ending_balance,
+                session_pnl=self.manager.daily_pnl,
+                total_trades=stats.get("total_trades", 0),
+                wins=state.get("win_count", 0),
+                losses=state.get("loss_count", 0),
+                commissions=self._total_commissions,
+                status=status,
+                halted_reason=halted_reason,
+            )
+            logger.info(f"Ended database session #{self._db_session_id}")
 
         # Send daily digest
         await self._send_daily_digest()
@@ -422,6 +539,9 @@ class HeadlessTradingSystem:
 
     def _on_bar(self, bar: FootprintBar) -> None:
         """Handle completed bar."""
+        # Reset stacked signals for new bar
+        self._current_bar_signals = []
+
         if self.router:
             self.router.on_bar(bar)
 
@@ -433,36 +553,157 @@ class HeadlessTradingSystem:
         if not self.router or not self.manager:
             return
 
+        # Track signal for stacking detection
+        self._current_bar_signals.append(signal)
+
         # Evaluate through router
         signal = self.router.evaluate_signal(signal)
 
         if signal.approved and not self.dry_run:
-            multiplier = self.router.get_position_size_multiplier()
-            order = self.manager.on_signal(signal, multiplier)
+            # Count stacked signals (same direction signals in current bar)
+            stacked_count = sum(
+                1 for s in self._current_bar_signals
+                if s.direction == signal.direction
+            )
+
+            # Use tier manager for position sizing (combined logic)
+            current_regime = self.router.current_regime if self.router else "UNKNOWN"
+            if self.tier_manager:
+                position_size = self.tier_manager.get_position_size(
+                    regime=current_regime,
+                    stacked_count=stacked_count,
+                    use_streaks=True,
+                )
+            else:
+                # Fallback to router multiplier if no tier manager
+                position_size = int(self.router.get_position_size_multiplier())
+
+            # Capture context BEFORE executing (for database logging)
+            self._pending_trade_context = {
+                "pattern": signal.pattern,
+                "signal_strength": getattr(signal, "strength", 0),
+                "regime": current_regime,
+                "regime_score": getattr(self.router, "regime_score", None),
+                "stacked_count": stacked_count,
+                "tier_index": self.tier_manager.state.tier_index if self.tier_manager else 0,
+                "tier_name": self.tier_manager.state.tier_name if self.tier_manager else None,
+                "instrument": self.tier_manager.state.instrument if self.tier_manager else self.symbol,
+                "win_streak": self.tier_manager.state.win_streak if self.tier_manager else 0,
+                "loss_streak": self.tier_manager.state.loss_streak if self.tier_manager else 0,
+            }
+
+            order = self.manager.on_signal(signal, absolute_size=position_size)
 
             if order:
                 logger.info(
-                    f"Order: {order.side} {order.size} @ {order.entry_price}"
+                    f"Order: {order.side} {order.size} @ {order.entry_price} "
+                    f"(stacked={stacked_count}, regime={current_regime})"
                 )
 
     def _on_trade_complete(self, trade) -> None:
-        """Handle completed trade - send Discord alert."""
+        """Handle completed trade - send Discord alert and update tier manager."""
+        # Record trade with tier manager for balance tracking and tier progression
+        if self.tier_manager:
+            self.tier_manager.record_trade(trade.pnl)
+
+        # Calculate commission (round-trip estimate)
+        # Typical futures commission: ~$2.25-$4.50 per side per contract
+        commission_per_contract = float(os.getenv("COMMISSION_PER_CONTRACT", "4.50"))
+        commission = commission_per_contract * trade.size * 2  # Round trip
+        self._total_commissions += commission
+
+        # Update trade exit in database
+        bracket_id = getattr(trade, 'bracket_id', None) or trade.trade_id
+        db_trade_id = self._open_trade_ids.pop(bracket_id, None)
+
+        if db_trade_id and self._db_session_id:
+            balance_after = self.tier_manager.state.balance if self.tier_manager else None
+            running_pnl = self.manager.daily_pnl if self.manager else 0
+
+            db_update_trade_exit(
+                trade_id=db_trade_id,
+                exit_price=trade.exit_price,
+                exit_time=trade.exit_time,
+                exit_reason=trade.exit_reason,
+                pnl_gross=trade.pnl,
+                pnl_ticks=trade.pnl_ticks,
+                commission=commission,
+                running_pnl=running_pnl,
+                account_balance=balance_after,
+            )
+            logger.debug(f"Updated trade #{db_trade_id} with exit: {trade.exit_reason}, P&L: ${trade.pnl:+,.2f}")
+
         asyncio.create_task(self._alert_trade_closed(trade))
         self._save_state()
 
     def _on_position_opened(self, position) -> None:
-        """Handle new position - send Discord alert."""
+        """Handle new position - send Discord alert and log to database."""
+        # Get context captured at signal time
+        ctx = self._pending_trade_context or {}
+        self._trade_count += 1
+
+        # Log trade entry to database
+        if self._db_session_id:
+            trade_id = db_log_trade(
+                session_id=self._db_session_id,
+                trade_num=self._trade_count,
+                internal_trade_id=position.position_id,
+                symbol=position.symbol,
+                direction=position.side,
+                size=position.size,
+                entry_price=position.entry_price,
+                entry_time=position.entry_time,
+                bracket_id=position.bracket_id,
+                stop_price=position.stop_price,
+                target_price=position.target_price,
+                pattern=ctx.get("pattern"),
+                signal_strength=ctx.get("signal_strength"),
+                regime=ctx.get("regime"),
+                regime_score=ctx.get("regime_score"),
+                tier_index=ctx.get("tier_index"),
+                tier_name=ctx.get("tier_name"),
+                instrument=ctx.get("instrument"),
+                stacked_count=ctx.get("stacked_count", 1),
+                win_streak=ctx.get("win_streak", 0),
+                loss_streak=ctx.get("loss_streak", 0),
+            )
+            # Track for later exit update
+            if position.bracket_id:
+                self._open_trade_ids[position.bracket_id] = trade_id
+            logger.debug(f"Logged trade entry #{trade_id} to database")
+
+        # Clear pending context
+        self._pending_trade_context = {}
+
         asyncio.create_task(self._alert_position_opened(position))
         self._save_state()
 
     async def _on_feed_connected(self, plant_type: str = "") -> None:
         """Handle data feed connection."""
         logger.info(f"Data feed connected: {plant_type}")
+
+        # Log to database
+        if self._db_session_id:
+            db_log_connection(
+                session_id=self._db_session_id,
+                event_type="CONNECTED",
+                plant_type=plant_type,
+            )
+
         await self.notifications.alert_connection_restored(plant_type)
 
     async def _on_feed_disconnected(self, plant_type: str = "") -> None:
         """Handle data feed disconnection."""
         logger.warning(f"Data feed disconnected: {plant_type}")
+
+        # Log to database
+        if self._db_session_id:
+            db_log_connection(
+                session_id=self._db_session_id,
+                event_type="DISCONNECTED",
+                plant_type=plant_type,
+            )
+
         await self.notifications.alert_connection_lost(plant_type)
 
     async def _on_session_halted(self) -> None:
@@ -480,6 +721,79 @@ class HeadlessTradingSystem:
                 message=f"**Reason:** {reason}\n**Daily P&L:** ${pnl:+,.2f}",
                 alert_type=AlertType.WARNING,
             )
+
+    async def _on_tier_change(self, change: dict) -> None:
+        """Handle tier change - send Discord notification, update session, and log to DB."""
+        old_tier = TIERS[change["from_tier"]]
+        new_tier = TIERS[change["to_tier"]]
+
+        direction = "UP" if change["to_tier"] > change["from_tier"] else "DOWN"
+        emoji = "🎉" if direction == "UP" else "⚠️"
+
+        old_symbol = self.symbol
+        new_symbol = new_tier["instrument"]
+
+        # Log tier change to database
+        if self._db_session_id:
+            db_log_tier_change(
+                session_id=self._db_session_id,
+                from_tier_index=change["from_tier"],
+                from_tier_name=old_tier["name"],
+                to_tier_index=change["to_tier"],
+                to_tier_name=new_tier["name"],
+                from_instrument=change["from_instrument"],
+                to_instrument=change["to_instrument"],
+                balance_at_change=change["balance"],
+                trigger_reason=direction,
+            )
+
+        # Update session settings for new tier
+        if self.session:
+            self.session.symbol = new_symbol
+            self.session.daily_loss_limit = new_tier["daily_loss_limit"]
+            self.session.max_position_size = new_tier["max_contracts"]
+            self.symbol = new_symbol
+
+        # Update engine symbol
+        if self.engine:
+            self.engine.config["symbol"] = new_symbol
+
+        # Switch data feed if instrument changed (MES <-> ES)
+        if old_symbol != new_symbol and self.data_adapter:
+            logger.info(f"Switching data feed: {old_symbol} -> {new_symbol}")
+            try:
+                # Unsubscribe from old symbol
+                if hasattr(self.data_adapter, 'client') and self.data_adapter.client:
+                    from async_rithmic import DataType
+                    await self.data_adapter.client.unsubscribe_from_market_data(
+                        self.data_adapter._current_symbol,
+                        self.data_adapter._current_exchange or "CME",
+                        DataType.LAST_TRADE,
+                    )
+                # Subscribe to new symbol
+                await self.data_adapter.subscribe(new_symbol, "CME")
+                logger.info(f"Data feed switched to {new_symbol}")
+            except Exception as e:
+                logger.error(f"Failed to switch data feed: {e}")
+                # Alert but continue - positions still managed
+
+        logger.info(
+            f"TIER CHANGE {direction}: {old_tier['name']} -> {new_tier['name']} "
+            f"({change['from_instrument']} -> {change['to_instrument']})"
+        )
+
+        # Send Discord notification
+        await self.notifications.send_alert(
+            title=f"{emoji} Tier Change: {direction}!",
+            message=(
+                f"**{old_tier['name']}** -> **{new_tier['name']}**\n\n"
+                f"**Balance:** ${change['balance']:,.2f}\n"
+                f"**Instrument:** {change['from_instrument']} -> {change['to_instrument']}\n"
+                f"**Max Contracts:** {old_tier['max_contracts']} -> {new_tier['max_contracts']}\n"
+                f"**Loss Limit:** ${abs(old_tier['daily_loss_limit'])} -> ${abs(new_tier['daily_loss_limit'])}"
+            ),
+            alert_type=AlertType.SUCCESS if direction == "UP" else AlertType.WARNING,
+        )
 
     # === Alert Helpers ===
 
@@ -579,16 +893,25 @@ class HeadlessTradingSystem:
             pos = self.manager.open_positions[0]
             position_str = f"{pos.side} {pos.size} @ {pos.entry_price}"
 
-        # Balance
-        ending_balance = getattr(
-            self.manager, 'paper_balance',
-            self._starting_balance + self.manager.daily_pnl
-        )
+        # Balance - use tier manager if available
+        if self.tier_manager:
+            ending_balance = self.tier_manager.state.balance
+            tier_info = self.tier_manager.get_status()
+        else:
+            ending_balance = getattr(
+                self.manager, 'paper_balance',
+                self._starting_balance + self.manager.daily_pnl
+            )
+            tier_info = None
 
         # Status
         status = "COMPLETED"
         if self.manager.is_halted:
             status = f"STOPPED EARLY ({self.manager.halt_reason})"
+
+        # Add tier status to status string
+        if tier_info:
+            status += f" | {tier_info['tier_name']}"
 
         digest = DailyDigest(
             date=datetime.now().strftime("%Y-%m-%d"),
@@ -610,6 +933,58 @@ class HeadlessTradingSystem:
 
         await self.notifications.send_daily_digest(digest)
 
+    # === Balance Polling ===
+
+    async def _poll_balance_loop(self) -> None:
+        """Periodically poll Rithmic for account balance and update tier manager."""
+        poll_interval = int(os.getenv("BALANCE_POLL_INTERVAL", "60"))  # Default: 60 seconds
+        logger.info(f"Starting balance polling (interval: {poll_interval}s)")
+
+        while self._running:
+            try:
+                await asyncio.sleep(poll_interval)
+
+                if not self._running:
+                    break
+
+                # Try to get balance from Rithmic
+                if self.data_adapter and hasattr(self.data_adapter, 'get_account_balance'):
+                    balance = await self.data_adapter.get_account_balance()
+
+                    if balance is not None:
+                        # Log account snapshot to database
+                        if self._db_session_id:
+                            open_positions = len(self.manager.open_positions) if self.manager else 0
+                            open_size = sum(p.size for p in self.manager.open_positions) if self.manager else 0
+                            unrealized = sum(p.unrealized_pnl for p in self.manager.open_positions) if self.manager else 0
+                            realized = self.manager.daily_pnl if self.manager else 0
+
+                            db_log_snapshot(
+                                session_id=self._db_session_id,
+                                account_balance=balance,
+                                unrealized_pnl=unrealized,
+                                realized_pnl=realized,
+                                open_position_count=open_positions,
+                                open_position_size=open_size,
+                            )
+
+                        # Update tier manager if balance changed
+                        if self.tier_manager:
+                            old_balance = self.tier_manager.state.balance
+                            if abs(balance - old_balance) > 0.01:
+                                logger.info(
+                                    f"Balance sync from Rithmic: ${old_balance:,.2f} -> ${balance:,.2f}"
+                                )
+                                self.tier_manager.set_balance(balance)
+
+            except asyncio.CancelledError:
+                logger.debug("Balance polling cancelled")
+                break
+            except Exception as e:
+                logger.warning(f"Balance poll error: {e}")
+                # Continue polling despite errors
+                await asyncio.sleep(poll_interval)
+
     # === State Management ===
 
     def _save_state(self) -> None:
@@ -619,6 +994,11 @@ class HeadlessTradingSystem:
 
         from src.core.persistence import serialize_positions, serialize_trades
 
+        # Get tier status for persistence
+        tier_status = None
+        if self.tier_manager:
+            tier_status = self.tier_manager.get_status()
+
         state = {
             "daily_pnl": self.manager.daily_pnl,
             "is_halted": self.manager.is_halted,
@@ -627,6 +1007,7 @@ class HeadlessTradingSystem:
             "trades": serialize_trades(self.manager.completed_trades),
             "tick_count": self._tick_count,
             "paper_balance": getattr(self.manager, 'paper_balance', None),
+            "tier_status": tier_status,
         }
 
         self.persistence.save_state(state)

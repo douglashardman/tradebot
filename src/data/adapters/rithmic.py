@@ -300,6 +300,71 @@ class RithmicAdapter:
         elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
         return elapsed < 60
 
+    async def get_account_balance(self, account_id: Optional[str] = None) -> Optional[float]:
+        """
+        Query account balance from Rithmic.
+
+        Args:
+            account_id: Specific account ID to query. If None, uses default account.
+
+        Returns:
+            Account balance in dollars, or None if query fails.
+        """
+        if not self.client or not self._connected:
+            logger.warning("Cannot query balance: not connected to Rithmic")
+            return None
+
+        try:
+            # Try to get account list and balance
+            # Note: This depends on async_rithmic supporting account queries
+            # The exact method name may vary based on the library version
+            if hasattr(self.client, 'get_account_list'):
+                accounts = await self.client.get_account_list()
+                if accounts:
+                    # Get the first account or specified account
+                    target_account = account_id or accounts[0].get('account_id')
+                    if hasattr(self.client, 'get_account_balance'):
+                        balance_data = await self.client.get_account_balance(target_account)
+                        if balance_data:
+                            # Return the available balance
+                            return float(balance_data.get('available_balance', 0))
+
+            # Alternative: Try get_pnl_position_updates if available
+            if hasattr(self.client, 'get_pnl_position_updates'):
+                pnl_data = await self.client.get_pnl_position_updates()
+                if pnl_data and 'account_balance' in pnl_data:
+                    return float(pnl_data['account_balance'])
+
+            logger.debug("Account balance query not supported by this Rithmic connection")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Failed to query account balance: {e}")
+            return None
+
+    def on_account_update(self, callback: Callable) -> None:
+        """
+        Register callback for account updates (balance changes, fills, etc.).
+
+        Args:
+            callback: Async callback function that receives account update data.
+        """
+        if not hasattr(self, '_account_callbacks'):
+            self._account_callbacks: List[Callable] = []
+        self._account_callbacks.append(callback)
+
+    async def _handle_account_update(self, data: dict) -> None:
+        """Process account update from Rithmic."""
+        if hasattr(self, '_account_callbacks'):
+            for callback in self._account_callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(data)
+                    else:
+                        callback(data)
+                except Exception as e:
+                    logger.error(f"Error in account callback: {e}")
+
 
 # Factory function for easy instantiation from environment variables
 def create_rithmic_adapter_from_env() -> RithmicAdapter:

@@ -54,13 +54,20 @@ class ExecutionManager:
         if session.mode == "paper":
             self.paper_balance = session.paper_starting_balance
 
-    def on_signal(self, signal: Signal, regime_multiplier: float = 1.0) -> Optional[BracketOrder]:
+    def on_signal(
+        self,
+        signal: Signal,
+        regime_multiplier: float = 1.0,
+        absolute_size: Optional[int] = None,
+    ) -> Optional[BracketOrder]:
         """
         Process an approved signal into a trade.
 
         Args:
             signal: The approved signal to execute
-            regime_multiplier: Position size multiplier from regime
+            regime_multiplier: Position size multiplier from regime (legacy)
+            absolute_size: If provided, use this as the exact position size
+                          (capped at session max). Used by tier system.
 
         Returns:
             BracketOrder if trade was submitted, None otherwise
@@ -94,8 +101,13 @@ class ExecutionManager:
             return None
 
         # Calculate position size
-        base_size = self.session.max_position_size
-        size = max(1, int(base_size * regime_multiplier))
+        if absolute_size is not None:
+            # Tier system provides absolute size, cap at session max
+            size = min(absolute_size, self.session.max_position_size)
+        else:
+            # Legacy: use multiplier
+            base_size = self.session.max_position_size
+            size = max(1, int(base_size * regime_multiplier))
 
         # Generate bracket order
         order = self._create_bracket_order(signal, size)
@@ -231,6 +243,8 @@ class ExecutionManager:
             exit_price=exit_price,
             exit_time=now,
             exit_reason=reason,
+            stop_price=position.stop_price,
+            target_price=position.target_price,
             pnl=pnl,
             pnl_ticks=pnl_ticks,
         )

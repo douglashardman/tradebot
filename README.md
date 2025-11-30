@@ -389,51 +389,54 @@ ticks = adapter.get_session_ticks(
 | 1 week (5 days) | ~3.75M | ~$6.00 |
 | 1 month (20 days) | ~15M | ~$24.00 |
 
-## Backtesting Results (110 Days: Jul-Nov 2025)
+## Backtesting Results (108 Days: Jul-Nov 2025)
+
+Tier progression backtest starting from $2,500 with the capital management system.
 
 ### Overall Performance
 | Metric | Value |
 |--------|-------|
-| Net P&L | $187,900 |
-| Profit Factor | 3.52 |
-| Total Trades | 1,342 |
-| Win Rate | 68% |
-| Winning Days | 85% (94/110) |
-| Avg Daily P&L | $1,708 |
-| Max Drawdown | $1,200 |
+| Starting Balance | $2,500 |
+| Final Balance | $193,760 |
+| Net P&L | $191,260 |
+| Profit Factor | 4.18 |
+| Total Trades | 614 |
+| Win Rate | 72% |
+| Winning Days | 81% (87/108) |
+| Avg Daily P&L | $1,771 |
+| Max Drawdown | $1,300 |
+| Max Consecutive Losses | 5 |
+
+### Tier Progression
+- **Day 1-6**: Tier 1 (MES Building) - $2,500 → $3,500
+- **Day 7+**: Tier 2 (ES Entry) - Graduated to ES futures
+- **Day 15**: Tier 3 (ES Growth) - Crossed $5,000
+- **Day 20**: Tier 4 (ES Scaling) - Crossed $7,500
+- **Day 25+**: Tier 5 (ES Full) - Crossed $10,000 and stayed
 
 ### Monthly Breakdown
-| Month | Days | Net P&L | Avg/Day | Win Days |
-|-------|------|---------|---------|----------|
-| July 2025 | 24 | $22,000 | $917 | 75% |
-| August 2025 | 21 | $34,100 | $1,624 | 95% |
-| September 2025 | 22 | $20,400 | $927 | 77% |
-| October 2025 | 23 | $44,900 | $1,952 | 87% |
-| November 2025 | 20 | $66,500 | $3,325 | 90% |
+| Month | Days | Net P&L | Avg/Day | Win Days | Win Rate |
+|-------|------|---------|---------|----------|----------|
+| July 2025 | 22 | $11,260 | $512 | 73% | 64% |
+| August 2025 | 21 | $39,600 | $1,886 | 90% | 74% |
+| September 2025 | 22 | $24,362 | $1,107 | 73% | 65% |
+| October 2025 | 23 | $43,500 | $1,891 | 78% | 70% |
+| November 2025 | 20 | $72,538 | $3,627 | 90% | 83% |
 
 ### Performance by Pattern
 | Pattern | Trades | Win% | Net P&L | Profit Factor |
 |---------|--------|------|---------|---------------|
-| BUYING_EXHAUSTION | 547 | 68% | $78,000 | 3.25 |
-| SELLING_EXHAUSTION | 502 | 70% | $74,700 | 3.47 |
-| SELLING_ABSORPTION | 127 | 75% | $21,900 | 4.45 |
-| BUYING_ABSORPTION | 118 | 76% | $20,900 | 4.68 |
-
-### Performance by Regime
-| Regime | Trades | Win% | Net P&L | Profit Factor |
-|--------|--------|------|---------|---------------|
-| RANGING | 671 | 68% | $93,000 | 3.15 |
-| TRENDING_DOWN | 322 | 72% | $52,100 | 3.94 |
-| TRENDING_UP | 301 | 73% | $50,400 | 4.08 |
+| SELLING_EXHAUSTION | 209 | 67% | $56,898 | 3.24 |
+| SELLING_ABSORPTION | 145 | 78% | $50,112 | 5.46 |
+| BUYING_ABSORPTION | 147 | 73% | $47,010 | 5.12 |
+| BUYING_EXHAUSTION | 104 | 74% | $34,560 | 4.20 |
 
 ### Stress Test Results (All Passed)
 | Test | Result | Notes |
 |------|--------|-------|
-| Slippage (1-2 ticks) | PASSED | $115,750 net P&L with worst-case slippage |
-| Time-of-Day | PASSED | All trading hours profitable |
-| Day-of-Week | PASSED | All weekdays profitable, Monday strongest |
-| Losing Streak | PASSED | Max 6 consecutive losses |
-| Monte Carlo (1000 sims) | PASSED | 0% risk of ruin |
+| Max Drawdown | PASSED | $1,300 max drawdown from peak |
+| Losing Streak | PASSED | Max 5 consecutive losses |
+| Tier Transitions | PASSED | Smooth progression through all 5 tiers |
 
 ### Running Backtests
 

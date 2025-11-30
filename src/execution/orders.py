@@ -198,6 +198,10 @@ class Trade:
     pnl: float
     pnl_ticks: int
 
+    # Bracket levels (planned stop/target)
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
+
     # Context
     trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     signal_pattern: Optional[str] = None
@@ -215,6 +219,8 @@ class Trade:
             "exit_price": self.exit_price,
             "exit_time": self.exit_time.isoformat(),
             "exit_reason": self.exit_reason,
+            "stop_price": self.stop_price,
+            "target_price": self.target_price,
             "pnl": self.pnl,
             "pnl_ticks": self.pnl_ticks,
             "signal_pattern": self.signal_pattern,

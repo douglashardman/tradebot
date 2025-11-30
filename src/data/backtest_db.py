@@ -14,7 +14,35 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     _create_tables(conn)
+    _migrate_tables(conn)
     return conn
+
+
+def _migrate_tables(conn: sqlite3.Connection) -> None:
+    """Add new columns to existing tables if they don't exist."""
+    # Check for tier columns in trades table
+    cursor = conn.execute("PRAGMA table_info(trades)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+
+    new_columns = [
+        ("tier_index", "INTEGER"),
+        ("tier_name", "TEXT"),
+        ("instrument", "TEXT"),
+        ("stacked_count", "INTEGER DEFAULT 1"),
+        ("win_streak", "INTEGER DEFAULT 0"),
+        ("loss_streak", "INTEGER DEFAULT 0"),
+        ("balance_before", "REAL"),
+        ("balance_after", "REAL"),
+    ]
+
+    for col_name, col_type in new_columns:
+        if col_name not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # Column might already exist
+
+    conn.commit()
 
 
 def _create_tables(conn: sqlite3.Connection) -> None:
@@ -63,6 +91,14 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             pnl_ticks REAL DEFAULT 0,
             exit_reason TEXT,
             running_equity REAL DEFAULT 0,
+            tier_index INTEGER,
+            tier_name TEXT,
+            instrument TEXT,
+            stacked_count INTEGER DEFAULT 1,
+            win_streak INTEGER DEFAULT 0,
+            loss_streak INTEGER DEFAULT 0,
+            balance_before REAL,
+            balance_after REAL,
             FOREIGN KEY (backtest_id) REFERENCES backtests(id)
         )
     """)
@@ -134,6 +170,38 @@ def log_backtest(
     return backtest_id
 
 
+def update_backtest(
+    backtest_id: int,
+    signals_generated: int = 0,
+    signals_approved: int = 0,
+    trades: int = 0,
+    wins: int = 0,
+    losses: int = 0,
+    pnl: float = 0,
+    notes: str = None,
+) -> None:
+    """Update a backtest record with final stats."""
+    conn = get_connection()
+    win_rate = wins / trades if trades > 0 else 0
+    conn.execute("""
+        UPDATE backtests SET
+            signals_generated = ?,
+            signals_approved = ?,
+            trades = ?,
+            wins = ?,
+            losses = ?,
+            pnl = ?,
+            win_rate = ?,
+            notes = ?
+        WHERE id = ?
+    """, (
+        signals_generated, signals_approved, trades, wins, losses,
+        pnl, win_rate, notes, backtest_id
+    ))
+    conn.commit()
+    conn.close()
+
+
 def log_trade(
     backtest_id: int,
     trade_num: int,
@@ -152,7 +220,15 @@ def log_trade(
     pnl: float = 0,
     pnl_ticks: float = 0,
     exit_reason: str = None,
-    running_equity: float = 0
+    running_equity: float = 0,
+    tier_index: int = None,
+    tier_name: str = None,
+    instrument: str = None,
+    stacked_count: int = 1,
+    win_streak: int = 0,
+    loss_streak: int = 0,
+    balance_before: float = None,
+    balance_after: float = None,
 ) -> int:
     """Log an individual trade to the database."""
     conn = get_connection()
@@ -160,13 +236,17 @@ def log_trade(
         INSERT INTO trades (
             backtest_id, trade_num, entry_time, exit_time, pattern, direction,
             regime, regime_score, signal_strength, entry_price, exit_price,
-            stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity,
+            tier_index, tier_name, instrument, stacked_count, win_streak, loss_streak,
+            balance_before, balance_after
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         backtest_id, trade_num, entry_time.isoformat() if entry_time else None,
         exit_time.isoformat() if exit_time else None, pattern, direction,
         regime, regime_score, signal_strength, entry_price, exit_price,
-        stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity
+        stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity,
+        tier_index, tier_name, instrument, stacked_count, win_streak, loss_streak,
+        balance_before, balance_after
     ))
     trade_id = cursor.lastrowid
     conn.commit()

@@ -36,6 +36,9 @@ class TradingSession:
     trading_end: time = field(default_factory=lambda: time(15, 45))
     no_trade_windows: List[Tuple[time, time]] = field(default_factory=list)
 
+    # For backtesting: bypass trading hours check
+    bypass_trading_hours: bool = False
+
     # Strategy Controls
     enabled_patterns: Optional[List[str]] = None  # None = all enabled
     min_signal_strength: float = 0.6
@@ -59,6 +62,10 @@ class TradingSession:
 
     def is_within_trading_hours(self, current_time: time = None) -> bool:
         """Check if current time is within trading hours."""
+        # Bypass for backtesting
+        if self.bypass_trading_hours:
+            return True
+
         if current_time is None:
             current_time = datetime.now().time()
 
