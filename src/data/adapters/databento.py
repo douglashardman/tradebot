@@ -64,7 +64,7 @@ class DatabentoAdapter:
 
         Databento trade fields:
         - ts_event: Exchange timestamp (nanoseconds)
-        - price: Trade price (as integer, divide by 1e9)
+        - price: Trade price (already in normal decimal format like 6765.25)
         - size: Trade size
         - side: 'A' (ask/sell aggressor), 'B' (bid/buy aggressor), 'N' (none)
         """
@@ -72,25 +72,20 @@ class DatabentoAdapter:
         ts_ns = record.ts_event
         ts_dt = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
 
-        # Convert price (Databento uses fixed-point integers)
-        price = float(record.price) / 1e9
+        # Price from raw records is in fixed-point (divide by 1e9)
+        # Note: .to_df() auto-converts, but raw iteration does not
+        raw_price = float(record.price)
+        price = raw_price / 1e9 if raw_price > 1e6 else raw_price
 
-        # Map side: Databento 'A' = sell aggressor (our "BID"), 'B' = buy aggressor (our "ASK")
-        # This is because:
-        # - 'A' (Ask) means someone hit the ask with a market buy -> buy aggressor -> "ASK" in our system
-        # - 'B' (Bid) means someone hit the bid with a market sell -> sell aggressor -> "BID" in our system
-        # Wait, let me reconsider:
-        # Databento docs say: "Ask for a sell aggressor, Bid for a buy aggressor"
-        # So 'A' = sell aggressor = hitting bids = "BID" in our terminology
-        # And 'B' = buy aggressor = lifting offers = "ASK" in our terminology
-
+        # Map side:
+        # 'B' = Buy aggressor = lifting the ask = buyer initiated = "ASK" in our system
+        # 'A' = Sell aggressor = hitting the bid = seller initiated = "BID" in our system
         if record.side == 'A':
             side = "BID"  # Sell aggressor hits bids
         elif record.side == 'B':
             side = "ASK"  # Buy aggressor lifts asks
         else:
-            # No side specified - default based on tick direction or skip
-            side = "ASK"  # Default to buy
+            side = "ASK"  # Default
 
         return Tick(
             timestamp=ts_dt,
@@ -238,6 +233,107 @@ class DatabentoAdapter:
 
         self._running = False
         print("Replay complete")
+
+
+    def get_session_ticks(
+        self,
+        contract: str,
+        date: str,
+        start_time: str = "09:30",
+        end_time: str = "16:00",
+        dataset: str = "GLBX.MDP3"
+    ) -> List[Tick]:
+        """
+        Get tick data for a trading session.
+
+        Args:
+            contract: Databento contract symbol (e.g., "ESZ5" for Dec 2025)
+            date: Date string YYYY-MM-DD
+            start_time: Session start time HH:MM (default 09:30 ET)
+            end_time: Session end time HH:MM (default 16:00 ET)
+            dataset: Databento dataset ID
+
+        Returns:
+            List of Tick objects for the session
+        """
+        try:
+            import databento as db
+        except ImportError:
+            raise ImportError("databento package required: pip install databento")
+
+        client = db.Historical(key=self.api_key)
+
+        # Construct datetime range (times are in ET, convert to UTC by adding 5 hours)
+        # Note: This is a simplification - proper timezone handling would be better
+        start_dt = f"{date}T{start_time}:00-05:00"
+        end_dt = f"{date}T{end_time}:00-05:00"
+
+        print(f"Fetching {contract} from {start_dt} to {end_dt}...")
+
+        data = client.timeseries.get_range(
+            dataset=dataset,
+            symbols=[contract],
+            schema="trades",
+            start=start_dt,
+            end=end_dt,
+        )
+
+        # Determine our symbol from the contract symbol
+        our_symbol = contract[:2] if contract[:3] not in ["MES", "MNQ"] else contract[:3]
+
+        ticks = []
+        for record in data:
+            try:
+                tick = self._convert_trade(record, our_symbol)
+                ticks.append(tick)
+            except Exception as e:
+                print(f"Error converting trade: {e}")
+
+        print(f"Got {len(ticks):,} ticks")
+        return ticks
+
+    @staticmethod
+    def get_front_month_contract(symbol: str, date: str = None) -> str:
+        """
+        Get the front month contract symbol for a given base symbol and date.
+
+        ES contract months: H (Mar), M (Jun), U (Sep), Z (Dec)
+        Contract rolls ~2 weeks before expiration (3rd Friday of contract month)
+
+        Args:
+            symbol: Base symbol (ES, MES, NQ, etc.)
+            date: Date to get contract for (YYYY-MM-DD), defaults to today
+
+        Returns:
+            Contract symbol (e.g., "ESZ5" for Dec 2025)
+        """
+        from datetime import datetime as dt
+
+        if date:
+            d = dt.strptime(date, "%Y-%m-%d")
+        else:
+            d = dt.now()
+
+        # Contract months and their roll dates (approximate)
+        # H=March, M=June, U=September, Z=December
+        # Roll happens ~2 weeks before 3rd Friday
+        month = d.month
+        year = d.year % 10  # Get LAST DIGIT only (2025 -> 5, 2026 -> 6)
+
+        if month <= 2 or (month == 3 and d.day < 7):
+            contract_month = "H"  # March
+        elif month <= 5 or (month == 6 and d.day < 7):
+            contract_month = "M"  # June
+        elif month <= 8 or (month == 9 and d.day < 7):
+            contract_month = "U"  # September
+        elif month <= 11 or (month == 12 and d.day < 7):
+            contract_month = "Z"  # December
+        else:
+            # Roll to next year's March
+            contract_month = "H"
+            year = (year + 1) % 10
+
+        return f"{symbol}{contract_month}{year}"
 
 
 class DatabentoHistoricalLoader:
