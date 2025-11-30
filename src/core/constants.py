@@ -1,6 +1,6 @@
 """Constants and symbol configurations."""
 
-# Tick sizes for futures contracts
+# Tick sizes for futures contracts and ETFs
 TICK_SIZES = {
     "ES": 0.25,
     "MES": 0.25,
@@ -13,6 +13,10 @@ TICK_SIZES = {
     "M2K": 0.10,
     "YM": 1.0,
     "MYM": 1.0,
+    # ETFs (for backtesting with Polygon free tier)
+    "SPY": 0.01,
+    "QQQ": 0.01,
+    "IWM": 0.01,
 }
 
 # Dollar value per tick
@@ -28,6 +32,10 @@ TICK_VALUES = {
     "M2K": 0.50,
     "YM": 5.00,
     "MYM": 0.50,
+    # ETFs - value per tick is $0.01 per share (for 100 share lots, use size=100)
+    "SPY": 0.01,
+    "QQQ": 0.01,
+    "IWM": 0.01,
 }
 
 # Symbol-specific tuning parameters
@@ -73,6 +81,21 @@ SYMBOL_PROFILES = {
         "typical_bar_volume": 2000,
         "stop_ticks": 20,   # 2.00
         "target_ticks": 30,  # 3.00
+    },
+    # ETFs for backtesting
+    "SPY": {
+        "imbalance_min_volume": 1000,
+        "absorption_min_volume": 5000,
+        "typical_bar_volume": 100000,
+        "stop_ticks": 50,   # $0.50
+        "target_ticks": 100,  # $1.00
+    },
+    "QQQ": {
+        "imbalance_min_volume": 500,
+        "absorption_min_volume": 3000,
+        "typical_bar_volume": 50000,
+        "stop_ticks": 50,   # $0.50
+        "target_ticks": 100,  # $1.00
     },
 }
 
