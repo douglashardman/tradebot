@@ -41,6 +41,32 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Individual trade tracking for detailed analysis
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            backtest_id INTEGER NOT NULL,
+            trade_num INTEGER NOT NULL,
+            entry_time TIMESTAMP NOT NULL,
+            exit_time TIMESTAMP,
+            pattern TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            regime TEXT,
+            regime_score REAL,
+            signal_strength REAL,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            stop_price REAL,
+            target_price REAL,
+            size INTEGER DEFAULT 1,
+            pnl REAL DEFAULT 0,
+            pnl_ticks REAL DEFAULT 0,
+            exit_reason TEXT,
+            running_equity REAL DEFAULT 0,
+            FOREIGN KEY (backtest_id) REFERENCES backtests(id)
+        )
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS spending (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +132,213 @@ def log_backtest(
     conn.close()
 
     return backtest_id
+
+
+def log_trade(
+    backtest_id: int,
+    trade_num: int,
+    entry_time: datetime,
+    pattern: str,
+    direction: str,
+    entry_price: float,
+    signal_strength: float = 0,
+    regime: str = None,
+    regime_score: float = None,
+    stop_price: float = None,
+    target_price: float = None,
+    size: int = 1,
+    exit_time: datetime = None,
+    exit_price: float = None,
+    pnl: float = 0,
+    pnl_ticks: float = 0,
+    exit_reason: str = None,
+    running_equity: float = 0
+) -> int:
+    """Log an individual trade to the database."""
+    conn = get_connection()
+    cursor = conn.execute("""
+        INSERT INTO trades (
+            backtest_id, trade_num, entry_time, exit_time, pattern, direction,
+            regime, regime_score, signal_strength, entry_price, exit_price,
+            stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        backtest_id, trade_num, entry_time.isoformat() if entry_time else None,
+        exit_time.isoformat() if exit_time else None, pattern, direction,
+        regime, regime_score, signal_strength, entry_price, exit_price,
+        stop_price, target_price, size, pnl, pnl_ticks, exit_reason, running_equity
+    ))
+    trade_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return trade_id
+
+
+def update_trade_exit(
+    trade_id: int,
+    exit_time: datetime,
+    exit_price: float,
+    pnl: float,
+    pnl_ticks: float,
+    exit_reason: str,
+    running_equity: float
+) -> None:
+    """Update a trade with exit information."""
+    conn = get_connection()
+    conn.execute("""
+        UPDATE trades SET
+            exit_time = ?,
+            exit_price = ?,
+            pnl = ?,
+            pnl_ticks = ?,
+            exit_reason = ?,
+            running_equity = ?
+        WHERE id = ?
+    """, (
+        exit_time.isoformat() if exit_time else None,
+        exit_price, pnl, pnl_ticks, exit_reason, running_equity, trade_id
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_trades_for_backtest(backtest_id: int) -> List[Dict]:
+    """Get all trades for a specific backtest."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM trades WHERE backtest_id = ? ORDER BY trade_num
+    """, (backtest_id,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_trade_analysis() -> Dict:
+    """Get comprehensive trade-level analysis across all backtests."""
+    conn = get_connection()
+
+    # Overall trade stats
+    row = conn.execute("""
+        SELECT
+            COUNT(*) as total_trades,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+            SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losing_trades,
+            SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) as gross_profit,
+            SUM(CASE WHEN pnl < 0 THEN ABS(pnl) ELSE 0 END) as gross_loss,
+            SUM(pnl) as net_pnl,
+            AVG(CASE WHEN pnl > 0 THEN pnl ELSE NULL END) as avg_win,
+            AVG(CASE WHEN pnl < 0 THEN pnl ELSE NULL END) as avg_loss,
+            MAX(pnl) as largest_win,
+            MIN(pnl) as largest_loss
+        FROM trades WHERE exit_price IS NOT NULL
+    """).fetchone()
+
+    total = row["total_trades"] or 0
+    wins = row["winning_trades"] or 0
+    gross_profit = row["gross_profit"] or 0
+    gross_loss = row["gross_loss"] or 0.001  # Avoid divide by zero
+
+    # Stats by regime
+    regime_rows = conn.execute("""
+        SELECT
+            regime,
+            COUNT(*) as trades,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(pnl) as pnl
+        FROM trades
+        WHERE exit_price IS NOT NULL AND regime IS NOT NULL
+        GROUP BY regime
+    """).fetchall()
+
+    # Stats by pattern
+    pattern_rows = conn.execute("""
+        SELECT
+            pattern,
+            COUNT(*) as trades,
+            SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(pnl) as pnl
+        FROM trades
+        WHERE exit_price IS NOT NULL
+        GROUP BY pattern
+    """).fetchall()
+
+    conn.close()
+
+    return {
+        "total_trades": total,
+        "winning_trades": wins,
+        "losing_trades": row["losing_trades"] or 0,
+        "win_rate": wins / total if total > 0 else 0,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else 0,
+        "net_pnl": row["net_pnl"] or 0,
+        "avg_win": row["avg_win"] or 0,
+        "avg_loss": row["avg_loss"] or 0,
+        "largest_win": row["largest_win"] or 0,
+        "largest_loss": row["largest_loss"] or 0,
+        "by_regime": [dict(r) for r in regime_rows],
+        "by_pattern": [dict(r) for r in pattern_rows],
+    }
+
+
+def get_equity_curve(backtest_id: int = None) -> List[Dict]:
+    """Get equity curve data (running P&L over time)."""
+    conn = get_connection()
+    if backtest_id:
+        rows = conn.execute("""
+            SELECT exit_time, pnl, running_equity
+            FROM trades
+            WHERE backtest_id = ? AND exit_time IS NOT NULL
+            ORDER BY exit_time
+        """, (backtest_id,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT t.exit_time, t.pnl, t.running_equity, b.date
+            FROM trades t
+            JOIN backtests b ON t.backtest_id = b.id
+            WHERE t.exit_time IS NOT NULL
+            ORDER BY b.date, t.exit_time
+        """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_max_drawdown() -> Dict:
+    """Calculate maximum drawdown from equity curve."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT t.exit_time, t.pnl, t.running_equity, b.date
+        FROM trades t
+        JOIN backtests b ON t.backtest_id = b.id
+        WHERE t.exit_time IS NOT NULL
+        ORDER BY b.date, t.exit_time
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        return {"max_drawdown": 0, "max_drawdown_pct": 0}
+
+    # Calculate running equity and drawdown
+    peak = 0
+    max_dd = 0
+    max_dd_pct = 0
+    cumulative = 0
+
+    for row in rows:
+        cumulative += row["pnl"]
+        if cumulative > peak:
+            peak = cumulative
+        dd = peak - cumulative
+        if dd > max_dd:
+            max_dd = dd
+            max_dd_pct = dd / peak if peak > 0 else 0
+
+    return {
+        "max_drawdown": max_dd,
+        "max_drawdown_pct": max_dd_pct,
+        "peak_equity": peak,
+        "final_equity": cumulative
+    }
 
 
 def get_total_spending() -> Dict:

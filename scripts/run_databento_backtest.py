@@ -14,7 +14,7 @@ from datetime import datetime, time
 
 from src.core.types import Tick, Signal, FootprintBar
 from src.data.adapters.databento import DatabentoAdapter
-from src.data.backtest_db import log_backtest, get_total_spending, print_summary
+from src.data.backtest_db import log_backtest, log_trade, get_total_spending, print_summary, get_trade_analysis, get_max_drawdown
 from src.analysis.engine import OrderFlowEngine
 from src.regime.router import StrategyRouter
 from src.execution.manager import ExecutionManager
@@ -137,11 +137,13 @@ def run_backtest(
         "timeframe": 300,  # 5-minute bars
     })
 
+    # Session times in UTC (Databento timestamps are UTC)
+    # 9:30 ET = 14:30 UTC, 16:00 ET = 21:00 UTC
     router = StrategyRouter({
         "min_signal_strength": 0.60,
         "min_regime_confidence": 0.50,
-        "session_open": time(9, 30),
-        "session_close": time(16, 0),
+        "session_open": time(14, 30),   # 9:30 ET in UTC
+        "session_close": time(21, 0),   # 16:00 ET in UTC
         "regime": {
             "min_regime_score": 3.5,
             "adx_trend_threshold": 25,
@@ -151,8 +153,8 @@ def run_backtest(
     session = TradingSession(
         mode="paper",
         symbol=symbol,
-        daily_profit_target=500.0,
-        daily_loss_limit=-300.0,
+        daily_profit_target=100000.0,  # No profit cap - let winners run
+        daily_loss_limit=-400.0,  # Keep loss limit
         max_position_size=1,
         max_concurrent_trades=1,
         stop_loss_ticks=16,  # 4 points for ES
@@ -169,6 +171,12 @@ def run_backtest(
     signals_generated = 0
     signals_approved = 0
     trades = []
+    current_tick = None  # Track current tick for timestamps
+    running_equity = 0.0
+    backtest_id_holder = [None]  # Use list to allow modification in nested function
+
+    # Max trades per day - no cap, let the system trade
+    MAX_TRADES_PER_DAY = 100  # Effectively unlimited
 
     def on_bar(bar: FootprintBar):
         router.on_bar(bar)
@@ -176,39 +184,95 @@ def run_backtest(
             manager.update_prices(bar.close_price)
 
     def on_signal(signal: Signal):
-        nonlocal signals_generated, signals_approved
+        nonlocal signals_generated, signals_approved, running_equity
         signals_generated += 1
 
         signal = router.evaluate_signal(signal)
 
         if signal.approved:
             signals_approved += 1
+            # Check max trades limit
+            if len(trades) >= MAX_TRADES_PER_DAY:
+                return  # Skip - already hit max trades for day
             if not manager.pending_orders and not manager.open_positions:
                 if signal.strength >= 0.60:
                     multiplier = router.get_position_size_multiplier()
                     order = manager.on_signal(signal, multiplier)
                     if order:
-                        trades.append({
-                            "pattern": signal.pattern.value if hasattr(signal.pattern, 'value') else str(signal.pattern),
+                        # Get current regime info
+                        regime_state = router.get_state()
+                        regime_name = regime_state.get("current_regime", "UNKNOWN")
+                        regime_score = regime_state.get("regime_confidence", 0)
+
+                        pattern_name = signal.pattern.value if hasattr(signal.pattern, 'value') else str(signal.pattern)
+
+                        trade_record = {
+                            "num": len(trades) + 1,
+                            "entry_time": current_tick.timestamp if current_tick else datetime.now(),
+                            "pattern": pattern_name,
                             "direction": signal.direction,
-                            "price": signal.price,
+                            "entry_price": order.entry_price,
+                            "stop_price": order.stop_price,
+                            "target_price": order.target_price,
                             "strength": signal.strength,
-                        })
-                        print(f"  TRADE #{len(trades)}: {order.side} @ {order.entry_price:.2f}")
+                            "regime": regime_name,
+                            "regime_score": regime_score,
+                            "exit_time": None,
+                            "exit_price": None,
+                            "pnl": 0,
+                            "exit_reason": None,
+                        }
+                        trades.append(trade_record)
+                        print(f"  TRADE #{len(trades)}: {order.side} @ {order.entry_price:.2f} "
+                              f"(regime={regime_name}, pattern={pattern_name})")
 
     engine.on_bar(on_bar)
     engine.on_signal(on_signal)
 
-    # Process ticks
+    # Process ticks and track position closes
+    last_position_count = 0
+    last_pnl = 0.0
+
     for tick in ticks:
+        current_tick = tick
         engine.process_tick(tick)
 
-    # Get results
+        # Check for position closes by monitoring manager state
+        state = manager.get_state()
+        current_pnl = state.get("daily_pnl", 0)
+
+        # If P&L changed and we have an open trade, mark it as closed
+        if current_pnl != last_pnl and trades:
+            pnl_change = current_pnl - last_pnl
+            # Find the last trade that hasn't been closed
+            for trade in reversed(trades):
+                if trade["exit_time"] is None:
+                    trade["exit_time"] = tick.timestamp
+                    trade["exit_price"] = tick.price
+                    trade["pnl"] = pnl_change
+                    running_equity += pnl_change
+                    trade["running_equity"] = running_equity
+
+                    # Determine exit reason
+                    if pnl_change > 0:
+                        trade["exit_reason"] = "target"
+                    elif pnl_change < 0:
+                        trade["exit_reason"] = "stop"
+                    else:
+                        trade["exit_reason"] = "manual"
+
+                    print(f"    -> EXIT #{trade['num']}: ${pnl_change:+.2f} ({trade['exit_reason']})")
+                    break
+
+            last_pnl = current_pnl
+
+    # Get final results
     stats = manager.get_statistics()
     state = manager.get_state()
 
-    wins = stats.get("winning_trades", 0)
-    losses = stats.get("losing_trades", 0)
+    # Count actual wins/losses from trade records
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    losses = sum(1 for t in trades if t["pnl"] < 0)
     pnl = state.get("daily_pnl", 0)
 
     result = {
@@ -227,7 +291,7 @@ def run_backtest(
     }
 
     # Log to database (from_cache=True means no spending logged)
-    log_backtest(
+    backtest_id = log_backtest(
         symbol=symbol,
         contract=contract,
         date=date,
@@ -242,6 +306,27 @@ def run_backtest(
         pnl=pnl,
         from_cache=from_cache
     )
+
+    # Log individual trades
+    for trade in trades:
+        log_trade(
+            backtest_id=backtest_id,
+            trade_num=trade["num"],
+            entry_time=trade["entry_time"],
+            pattern=trade["pattern"],
+            direction=trade["direction"],
+            entry_price=trade["entry_price"],
+            signal_strength=trade.get("strength", 0),
+            regime=trade.get("regime"),
+            regime_score=trade.get("regime_score"),
+            stop_price=trade.get("stop_price"),
+            target_price=trade.get("target_price"),
+            exit_time=trade.get("exit_time"),
+            exit_price=trade.get("exit_price"),
+            pnl=trade.get("pnl", 0),
+            exit_reason=trade.get("exit_reason"),
+            running_equity=trade.get("running_equity", 0)
+        )
 
     print(f"\nResults:")
     print(f"  Ticks: {len(ticks):,}")
@@ -327,6 +412,43 @@ def main():
 
         # Final summary
         print_summary()
+
+        # Trade-level analysis
+        trade_stats = get_trade_analysis()
+        if trade_stats["total_trades"] > 0:
+            print(f"\n{'='*60}")
+            print("TRADE-LEVEL ANALYSIS")
+            print(f"{'='*60}")
+            print(f"\nOverall:")
+            print(f"  Total trades: {trade_stats['total_trades']}")
+            print(f"  Win rate: {trade_stats['win_rate']:.1%}")
+            print(f"  Profit factor: {trade_stats['profit_factor']:.2f}")
+            print(f"  Gross profit: ${trade_stats['gross_profit']:.2f}")
+            print(f"  Gross loss: ${trade_stats['gross_loss']:.2f}")
+            print(f"  Net P&L: ${trade_stats['net_pnl']:.2f}")
+            print(f"  Avg win: ${trade_stats['avg_win']:.2f}")
+            print(f"  Avg loss: ${trade_stats['avg_loss']:.2f}")
+            print(f"  Largest win: ${trade_stats['largest_win']:.2f}")
+            print(f"  Largest loss: ${trade_stats['largest_loss']:.2f}")
+
+            if trade_stats['by_regime']:
+                print(f"\nBy Regime:")
+                for r in trade_stats['by_regime']:
+                    wr = r['wins'] / r['trades'] if r['trades'] > 0 else 0
+                    print(f"  {r['regime']}: {r['trades']} trades, {wr:.0%} win rate, ${r['pnl']:.2f}")
+
+            if trade_stats['by_pattern']:
+                print(f"\nBy Pattern:")
+                for p in trade_stats['by_pattern']:
+                    wr = p['wins'] / p['trades'] if p['trades'] > 0 else 0
+                    print(f"  {p['pattern']}: {p['trades']} trades, {wr:.0%} win rate, ${p['pnl']:.2f}")
+
+            # Max drawdown
+            dd = get_max_drawdown()
+            print(f"\nDrawdown:")
+            print(f"  Max drawdown: ${dd['max_drawdown']:.2f}")
+            print(f"  Peak equity: ${dd['peak_equity']:.2f}")
+            print(f"  Final equity: ${dd['final_equity']:.2f}")
 
     elif args.date:
         contract = args.contract or DatabentoAdapter.get_front_month_contract("ES", args.date)

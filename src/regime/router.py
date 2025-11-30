@@ -11,14 +11,16 @@ from src.regime.inputs import RegimeInputsCalculator
 STRATEGY_REGIME_MAP: Dict[Regime, Dict[str, Any]] = {
     Regime.TRENDING_UP: {
         "enabled_patterns": [
-            SignalPattern.STACKED_BUY_IMBALANCE,
+            # Only non-imbalance patterns - imbalances catch wrong timing in trends
             SignalPattern.BUYING_ABSORPTION,
             SignalPattern.SELLING_EXHAUSTION,
             SignalPattern.BULLISH_DELTA_DIVERGENCE,
-            SignalPattern.BUY_IMBALANCE,
         ],
         "disabled_patterns": [
+            # All imbalance patterns disabled in trending - 0% win rate
+            SignalPattern.BUY_IMBALANCE,
             SignalPattern.SELL_IMBALANCE,
+            SignalPattern.STACKED_BUY_IMBALANCE,
             SignalPattern.STACKED_SELL_IMBALANCE,
             SignalPattern.BEARISH_DELTA_DIVERGENCE,
         ],
@@ -29,15 +31,17 @@ STRATEGY_REGIME_MAP: Dict[Regime, Dict[str, Any]] = {
 
     Regime.TRENDING_DOWN: {
         "enabled_patterns": [
-            SignalPattern.STACKED_SELL_IMBALANCE,
+            # Only non-imbalance patterns - imbalances catch wrong timing in trends
             SignalPattern.SELLING_ABSORPTION,
             SignalPattern.BUYING_EXHAUSTION,
             SignalPattern.BEARISH_DELTA_DIVERGENCE,
-            SignalPattern.SELL_IMBALANCE,
         ],
         "disabled_patterns": [
+            # All imbalance patterns disabled in trending - 0% win rate
             SignalPattern.BUY_IMBALANCE,
+            SignalPattern.SELL_IMBALANCE,
             SignalPattern.STACKED_BUY_IMBALANCE,
+            SignalPattern.STACKED_SELL_IMBALANCE,
             SignalPattern.BULLISH_DELTA_DIVERGENCE,
         ],
         "bias": "SHORT",
@@ -143,6 +147,13 @@ class StrategyRouter:
         if not regime_config:
             signal.approved = False
             signal.rejection_reason = "Unknown regime"
+            self.signals_rejected += 1
+            return signal
+
+        # NO_TRADE regime - reject all signals immediately
+        if self.current_regime == Regime.NO_TRADE:
+            signal.approved = False
+            signal.rejection_reason = "NO_TRADE regime - sitting out"
             self.signals_rejected += 1
             return signal
 

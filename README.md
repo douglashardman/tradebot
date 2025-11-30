@@ -311,6 +311,62 @@ ticks = adapter.get_session_ticks(
 | 1 week (5 days) | ~3.75M | ~$6.00 |
 | 1 month (20 days) | ~15M | ~$24.00 |
 
+## Backtesting Results (98 Days: Jul-Nov 2025)
+
+### Overall Performance
+| Metric | Value |
+|--------|-------|
+| Net P&L | $173,200 |
+| Profit Factor | 3.52 |
+| Total Trades | 1,188 |
+| Win Rate | 67.8% |
+| Winning Days | 85% (83/98) |
+| Avg Daily P&L | $1,767 |
+| Max Drawdown | $1,200 |
+
+### Performance by Pattern
+| Pattern | Trades | Win% | Net P&L | Profit Factor |
+|---------|--------|------|---------|---------------|
+| BUYING_EXHAUSTION | 485 | 68% | $69,000 | 3.25 |
+| SELLING_EXHAUSTION | 441 | 70% | $65,800 | 3.47 |
+| SELLING_ABSORPTION | 111 | 75% | $19,300 | 4.45 |
+| BUYING_ABSORPTION | 103 | 76% | $18,400 | 4.68 |
+
+### Performance by Regime
+| Regime | Trades | Win% | Net P&L | Profit Factor |
+|--------|--------|------|---------|---------------|
+| RANGING | 598 | 68% | $82,900 | 3.15 |
+| TRENDING_DOWN | 283 | 72% | $45,900 | 3.94 |
+| TRENDING_UP | 268 | 73% | $44,400 | 4.08 |
+
+### Running Backtests
+
+```bash
+# Run backtest for a single day
+PYTHONPATH=. python scripts/run_databento_backtest.py --date 2025-11-20
+
+# Run batch backtests
+PYTHONPATH=. python scripts/run_batch_backtest.py
+
+# View backtest database summary
+PYTHONPATH=. python -c "from src.data.backtest_db import print_summary; print_summary()"
+```
+
+## Stress Testing
+
+The system includes comprehensive stress tests to validate robustness:
+
+```bash
+# Run all stress tests
+PYTHONPATH=. python scripts/stress_tests.py
+
+# Individual tests
+PYTHONPATH=. python scripts/stress_tests.py --slippage      # 1-2 tick slippage
+PYTHONPATH=. python scripts/stress_tests.py --time-of-day   # Hourly breakdown
+PYTHONPATH=. python scripts/stress_tests.py --day-of-week   # Monday-Friday analysis
+PYTHONPATH=. python scripts/stress_tests.py --monte-carlo   # 1000 randomizations
+```
+
 ## License
 
 MIT

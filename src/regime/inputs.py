@@ -35,6 +35,9 @@ class RegimeInputsCalculator:
         self.session_open = self.config.get("session_open", DEFAULT_SESSION_OPEN)
         self.session_close = self.config.get("session_close", DEFAULT_SESSION_CLOSE)
 
+        # Last bar time - used for backtesting (avoids wall clock dependency)
+        self._last_bar_time: Optional[datetime] = None
+
     def add_bar(self, bar: FootprintBar) -> None:
         """Add a new bar to the history."""
         self.bars.append(bar)
@@ -45,6 +48,9 @@ class RegimeInputsCalculator:
             close=bar.close_price,
             volume=bar.total_volume
         ))
+
+        # Store the last bar's timestamp for time context calculations
+        self._last_bar_time = bar.end_time
 
         # Keep bounded
         max_bars = 200
@@ -96,9 +102,11 @@ class RegimeInputsCalculator:
         lower_lows = check_lower_lows(lows, 5)
         range_bars = count_range_bound_bars(highs, lows, 10)
 
-        # Time context
-        now = datetime.now()
-        current_time = now.time()
+        # Time context - use bar time for backtesting, wall clock for live
+        if self._last_bar_time:
+            current_time = self._last_bar_time.time()
+        else:
+            current_time = datetime.now().time()
         mins_since_open = self._minutes_since(self.session_open, current_time)
         mins_to_close = self._minutes_until(current_time, self.session_close)
 
@@ -126,8 +134,19 @@ class RegimeInputsCalculator:
         )
 
     def _default_inputs(self) -> RegimeInputs:
-        """Return default inputs when not enough bar history."""
-        return RegimeInputs()  # Uses dataclass defaults
+        """Return default inputs when not enough bar history.
+
+        Use bar timestamp if available for time context.
+        """
+        inputs = RegimeInputs()  # Uses dataclass defaults
+
+        # If we have a bar timestamp, use it for time context
+        if self._last_bar_time:
+            current_time = self._last_bar_time.time()
+            inputs.minutes_since_open = self._minutes_since(self.session_open, current_time)
+            inputs.minutes_to_close = self._minutes_until(current_time, self.session_close)
+
+        return inputs
 
     def _minutes_since(self, start: time, current: time) -> int:
         """Calculate minutes elapsed since a start time."""
