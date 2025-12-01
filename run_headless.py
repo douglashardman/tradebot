@@ -401,9 +401,8 @@ class HeadlessTradingSystem:
         """
         Warm up the engine and router with recent historical data.
 
-        Fetches recent tick data from Databento and processes it through the
-        engine to build up bar history. This ensures the regime detector has
-        enough data to make accurate classifications from the start.
+        First tries to load from local Parquet cache (free), then falls back
+        to Databento historical API (costs ~$2/day) if no local data.
 
         Args:
             hours: Number of hours of historical data to load (default 3.0)
@@ -411,46 +410,35 @@ class HeadlessTradingSystem:
         Returns:
             True if warmup successful, False otherwise
         """
-        api_key = os.getenv("DATABENTO_API_KEY")
-        if not api_key:
-            logger.warning("No DATABENTO_API_KEY - skipping warmup")
-            return True  # Non-fatal, continue without warmup
+        from src.data.aggregator import FootprintAggregator
 
-        try:
-            from src.data.adapters.databento import DatabentoAdapter
-            from src.data.aggregator import FootprintAggregator
+        logger.info(f"Starting historical warmup ({hours}h of data)...")
 
-            logger.info(f"Starting historical warmup ({hours}h of data)...")
+        now_et = datetime.now(ET)
+        start_time = now_et - timedelta(hours=hours)
 
-            # Calculate time range
-            now_et = datetime.now(ET)
-            start_time = now_et - timedelta(hours=hours)
+        # Try local Parquet cache first (FREE)
+        ticks = self._load_local_ticks(start_time, now_et)
+        source = "local cache"
 
-            # Format for Databento API (ISO format with timezone)
-            start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S-05:00")
-            end_str = now_et.strftime("%Y-%m-%dT%H:%M:%S-05:00")
-
-            # Get the front-month contract symbol
-            adapter = DatabentoAdapter(api_key=api_key)
-            contract = adapter._get_front_month_contract(self.symbol)
-
-            logger.info(f"Fetching {contract} ticks from {start_time.strftime('%H:%M')} to {now_et.strftime('%H:%M')} ET")
-
-            # Fetch historical data
-            ticks = adapter.get_historical(
-                symbol=contract,
-                start=start_str,
-                end=end_str,
-            )
-
-            if not ticks:
-                logger.warning("No historical ticks returned - starting cold")
+        # Fall back to Databento if no local data (PAID)
+        if not ticks:
+            api_key = os.getenv("DATABENTO_API_KEY")
+            if api_key:
+                ticks = self._fetch_databento_ticks(api_key, start_time, now_et)
+                source = "Databento"
+            else:
+                logger.warning("No local cache and no DATABENTO_API_KEY - starting cold")
                 return True
 
-            logger.info(f"Processing {len(ticks):,} historical ticks for warmup...")
+        if not ticks:
+            logger.warning("No historical ticks available - starting cold")
+            return True
 
+        logger.info(f"Processing {len(ticks):,} ticks from {source} for warmup...")
+
+        try:
             # Use a separate aggregator for warmup to avoid triggering signal callbacks
-            # This builds bars and feeds them directly to the router for regime detection
             warmup_aggregator = FootprintAggregator(self.timeframe)
             warmup_bars = 0
 
@@ -477,7 +465,7 @@ class HeadlessTradingSystem:
             await self.notifications.send_alert(
                 title="System Warmed Up",
                 message=(
-                    f"Loaded {hours}h of history: {len(ticks):,} ticks, {warmup_bars} bars\n"
+                    f"Loaded {hours}h from {source}: {len(ticks):,} ticks, {warmup_bars} bars\n"
                     f"Starting regime: **{regime}** ({confidence:.0%})"
                 ),
                 alert_type=AlertType.INFO,
@@ -489,13 +477,80 @@ class HeadlessTradingSystem:
             logger.error(f"Warmup failed: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            # Non-fatal - continue without warmup
             await self.notifications.send_alert(
                 title="Warmup Failed",
                 message=f"Starting cold (no bar history): {e}",
                 alert_type=AlertType.WARNING,
             )
             return True  # Continue anyway
+
+    def _load_local_ticks(self, start_time: datetime, end_time: datetime) -> List:
+        """
+        Load ticks from local Parquet cache.
+
+        Returns ticks within the time range from today's and yesterday's files.
+        """
+        from src.data.tick_logger import TickLogger
+
+        ticks = []
+        tick_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ticks")
+
+        if not os.path.exists(tick_dir):
+            return ticks
+
+        # Check today's and yesterday's files (warmup may span midnight)
+        dates_to_check = [
+            start_time.strftime("%Y-%m-%d"),
+            end_time.strftime("%Y-%m-%d"),
+        ]
+
+        for date_str in set(dates_to_check):
+            parquet_file = os.path.join(tick_dir, f"{date_str}.parquet")
+            if os.path.exists(parquet_file):
+                try:
+                    file_ticks = TickLogger.load_parquet(parquet_file)
+                    # Filter to time range
+                    for tick in file_ticks:
+                        # Make tick timestamp timezone-aware if needed
+                        tick_ts = tick.timestamp
+                        if tick_ts.tzinfo is None:
+                            tick_ts = tick_ts.replace(tzinfo=start_time.tzinfo)
+                        if start_time <= tick_ts <= end_time:
+                            ticks.append(tick)
+                    logger.info(f"Loaded {len(file_ticks):,} ticks from {parquet_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to load {parquet_file}: {e}")
+
+        # Sort by timestamp
+        ticks.sort(key=lambda t: t.timestamp)
+        return ticks
+
+    def _fetch_databento_ticks(self, api_key: str, start_time: datetime, end_time: datetime) -> List:
+        """
+        Fetch ticks from Databento historical API (paid).
+        """
+        try:
+            from src.data.adapters.databento import DatabentoAdapter
+
+            # Format for Databento API
+            start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S-05:00")
+            end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S-05:00")
+
+            adapter = DatabentoAdapter(api_key=api_key)
+            contract = adapter._get_front_month_contract(self.symbol)
+
+            logger.info(f"Fetching {contract} from Databento ({start_time.strftime('%H:%M')} to {end_time.strftime('%H:%M')} ET)")
+
+            ticks = adapter.get_historical(
+                symbol=contract,
+                start=start_str,
+                end=end_str,
+            )
+            return ticks or []
+
+        except Exception as e:
+            logger.error(f"Databento fetch failed: {e}")
+            return []
 
     async def _connect_databento(self) -> bool:
         """Connect to Databento live data feed."""

@@ -128,12 +128,16 @@ WARMUP_HOURS=3.0  # Hours of history to load (0 to disable)
 ```
 
 ### Historical Warmup
-On startup, the system loads recent historical tick data from Databento and processes it to build bar history. This ensures the regime detector has enough data (21+ bars) to make accurate classifications immediately.
+On startup, the system loads recent historical tick data and processes it to build bar history. This ensures the regime detector has enough data (21+ bars) to make accurate classifications immediately.
+
+**Data sources (in order of preference):**
+1. **Local Parquet cache** (FREE) - uses `data/ticks/*.parquet` files we've already collected
+2. **Databento historical API** (PAID ~$2/day) - fallback if no local data
 
 - Default: 3 hours of history (~36 bars at 5-min timeframe)
 - Set `WARMUP_HOURS=0` to disable (start cold)
 - Warmup happens before live feed connects
-- Discord notification shows starting regime and confidence
+- Discord notification shows starting regime, confidence, and data source
 
 ### Trading Parameters
 - Stop Loss: 16 ticks (4 points)
