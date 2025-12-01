@@ -397,6 +397,106 @@ class HeadlessTradingSystem:
             )
             return False
 
+    async def warmup_historical(self, hours: float = 3.0) -> bool:
+        """
+        Warm up the engine and router with recent historical data.
+
+        Fetches recent tick data from Databento and processes it through the
+        engine to build up bar history. This ensures the regime detector has
+        enough data to make accurate classifications from the start.
+
+        Args:
+            hours: Number of hours of historical data to load (default 3.0)
+
+        Returns:
+            True if warmup successful, False otherwise
+        """
+        api_key = os.getenv("DATABENTO_API_KEY")
+        if not api_key:
+            logger.warning("No DATABENTO_API_KEY - skipping warmup")
+            return True  # Non-fatal, continue without warmup
+
+        try:
+            from src.data.adapters.databento import DatabentoAdapter
+            from src.data.aggregator import FootprintAggregator
+
+            logger.info(f"Starting historical warmup ({hours}h of data)...")
+
+            # Calculate time range
+            now_et = datetime.now(ET)
+            start_time = now_et - timedelta(hours=hours)
+
+            # Format for Databento API (ISO format with timezone)
+            start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S-05:00")
+            end_str = now_et.strftime("%Y-%m-%dT%H:%M:%S-05:00")
+
+            # Get the front-month contract symbol
+            adapter = DatabentoAdapter(api_key=api_key)
+            contract = adapter._get_front_month_contract(self.symbol)
+
+            logger.info(f"Fetching {contract} ticks from {start_time.strftime('%H:%M')} to {now_et.strftime('%H:%M')} ET")
+
+            # Fetch historical data
+            ticks = adapter.get_historical(
+                symbol=contract,
+                start=start_str,
+                end=end_str,
+            )
+
+            if not ticks:
+                logger.warning("No historical ticks returned - starting cold")
+                return True
+
+            logger.info(f"Processing {len(ticks):,} historical ticks for warmup...")
+
+            # Use a separate aggregator for warmup to avoid triggering signal callbacks
+            # This builds bars and feeds them directly to the router for regime detection
+            warmup_aggregator = FootprintAggregator(self.timeframe)
+            warmup_bars = 0
+
+            for tick in ticks:
+                # Only process if symbol matches
+                if tick.symbol == self.symbol or tick.symbol.startswith(self.symbol):
+                    completed_bar = warmup_aggregator.process_tick(tick)
+                    if completed_bar:
+                        # Feed bar to router for regime detection only (no signal processing)
+                        if self.router:
+                            self.router.on_bar(completed_bar)
+                        warmup_bars += 1
+
+            # Log warmup results
+            regime = self.router.current_regime.value if self.router else "N/A"
+            confidence = self.router.regime_confidence if self.router else 0
+
+            logger.info(
+                f"Warmup complete: {len(ticks):,} ticks -> {warmup_bars} bars | "
+                f"Regime: {regime} ({confidence:.0%} confidence)"
+            )
+
+            # Send Discord notification
+            await self.notifications.send_alert(
+                title="System Warmed Up",
+                message=(
+                    f"Loaded {hours}h of history: {len(ticks):,} ticks, {warmup_bars} bars\n"
+                    f"Starting regime: **{regime}** ({confidence:.0%})"
+                ),
+                alert_type=AlertType.INFO,
+            )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Warmup failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Non-fatal - continue without warmup
+            await self.notifications.send_alert(
+                title="Warmup Failed",
+                message=f"Starting cold (no bar history): {e}",
+                alert_type=AlertType.WARNING,
+            )
+            return True  # Continue anyway
+
     async def _connect_databento(self) -> bool:
         """Connect to Databento live data feed."""
         try:
@@ -1482,6 +1582,11 @@ async def main():
     if not await system.setup():
         logger.error("Setup failed")
         sys.exit(1)
+
+    # Warm up with historical data (builds bar history for regime detection)
+    warmup_hours = float(os.getenv("WARMUP_HOURS", "3.0"))
+    if warmup_hours > 0:
+        await system.warmup_historical(hours=warmup_hours)
 
     # Connect to data feed
     if not await system.connect_data_feed():

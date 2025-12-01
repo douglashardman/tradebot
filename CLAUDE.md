@@ -122,7 +122,18 @@ TRADING_SYMBOL=MES
 TRADING_MODE=paper
 STARTING_BALANCE=2500
 DAILY_LOSS_LIMIT=-300
+
+# Warmup (loads historical data on startup)
+WARMUP_HOURS=3.0  # Hours of history to load (0 to disable)
 ```
+
+### Historical Warmup
+On startup, the system loads recent historical tick data from Databento and processes it to build bar history. This ensures the regime detector has enough data (21+ bars) to make accurate classifications immediately.
+
+- Default: 3 hours of history (~36 bars at 5-min timeframe)
+- Set `WARMUP_HOURS=0` to disable (start cold)
+- Warmup happens before live feed connects
+- Discord notification shows starting regime and confidence
 
 ### Trading Parameters
 - Stop Loss: 16 ticks (4 points)
