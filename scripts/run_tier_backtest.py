@@ -43,6 +43,37 @@ from src.execution.session import TradingSession
 from src.data.adapters.databento import DatabentoAdapter
 from src.data.backtest_db import log_backtest, log_trade, update_backtest, get_connection
 
+# Cache directory for tick data
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "../data/tick_cache")
+
+
+def load_cached_ticks(contract: str, date: str, start_time: str = "09:30", end_time: str = "16:00"):
+    """Load ticks from cache file if it exists."""
+    import json
+    from src.core.types import Tick
+
+    safe_start = start_time.replace(":", "")
+    safe_end = end_time.replace(":", "")
+    cache_path = os.path.join(CACHE_DIR, f"{contract}_{date}_{safe_start}_{safe_end}.json")
+
+    if not os.path.exists(cache_path):
+        return None
+
+    logger.info(f"Loading from cache: {cache_path}")
+    with open(cache_path) as f:
+        data = json.load(f)
+
+    ticks = []
+    for d in data:
+        ticks.append(Tick(
+            timestamp=datetime.fromisoformat(d["timestamp"]),
+            price=d["price"],
+            volume=d["volume"],
+            side=d["side"],
+            symbol=d["symbol"]
+        ))
+    return ticks
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -432,18 +463,26 @@ class TierBacktester:
         self._setup_day(date)
 
         # Get tick data
-        adapter = DatabentoAdapter()
         symbol = self.tier_manager.state.instrument
-        contract = adapter.get_front_month_contract(symbol, date)  # Pass date for correct contract
+        contract = DatabentoAdapter.get_front_month_contract(symbol, date)
 
         logger.info(f"Loading tick data for {contract} on {date}...")
 
-        ticks = adapter.get_session_ticks(
-            contract=contract,
-            date=date,
-            start_time="09:30",
-            end_time="16:00",
-        )
+        # Try cache first (FREE!)
+        ticks = load_cached_ticks(contract, date)
+
+        if ticks:
+            logger.info(f"Loaded {len(ticks):,} ticks from cache (no Databento cost)")
+        else:
+            # Fall back to Databento (costs money)
+            logger.warning(f"Cache miss for {contract} {date} - fetching from Databento...")
+            adapter = DatabentoAdapter()
+            ticks = adapter.get_session_ticks(
+                contract=contract,
+                date=date,
+                start_time="09:30",
+                end_time="16:00",
+            )
 
         if not ticks:
             logger.warning(f"No tick data for {date}")

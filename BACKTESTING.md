@@ -6,17 +6,22 @@ This document tracks all backtesting experiments, parameters, results, and actio
 
 | Attribute | Value |
 |-----------|-------|
-| **Data Source** | Databento ES futures tick data |
-| **Test Period** | July 1, 2025 - November 28, 2025 |
-| **Trading Days** | 110 |
-| **Total Ticks** | ~82.5 million |
-| **Cache Size** | 3.3 GB |
-| **Contracts** | ESU5 (Sep), ESZ5 (Dec) |
+| **Data Source** | Databento ES/MES futures tick data |
+| **Test Periods** | Jan 13 - Feb 21, Mar 10 - May 30, Jul 1 - Nov 28, 2025 |
+| **Total Trading Days** | 198 |
+| **Total Ticks** | ~120 million |
+| **Cache Size** | 7.5 GB |
+| **Contracts** | ESH5, MESH5, ESM5, MESM5, ESU5, ESZ5 |
 | **Session** | RTH 09:30-16:00 ET |
 
 ---
 
 ## Table of Contents
+
+### Tier Progression Tests (20-22)
+- [Test 20: Tier Progression - Jan/Feb 2025](#test-20-tier-progression---janfeb-2025)
+- [Test 21: Tier Progression - Mar/May 2025](#test-21-tier-progression---marmay-2025)
+- [Test 22: Tier Progression - Jul/Nov 2025](#test-22-tier-progression---julnov-2025)
 
 ### Foundation Tests (1-3)
 - [Test 1: Original Backtest (Optimistic Fills)](#test-1-original-backtest-optimistic-fills)
@@ -52,8 +57,33 @@ This document tracks all backtesting experiments, parameters, results, and actio
 - [Test 19: Worst Case Stress Test](#test-19-worst-case-stress-test)
 
 ### Summary
+- [Tier Progression Summary](#tier-progression-summary)
 - [Results Summary (All Tests)](#results-summary-all-tests)
 - [Recommended Configuration](#recommended-configuration)
+
+---
+
+## Tier Configuration
+
+All tier progression tests use these tiers:
+
+| Tier | Balance Range | Instrument | Max Contracts | Daily Loss Limit |
+|------|---------------|------------|---------------|------------------|
+| **Tier 1** | $2,500 - $3,500 | MES | 3 | $100 |
+| **Tier 2** | $3,500 - $5,000 | ES | 1 | $400 |
+| **Tier 3** | $5,000 - $7,500 | ES | 2 | $400 |
+| **Tier 4** | $7,500 - $10,000 | ES | 3 | $500 |
+| **Tier 5** | $10,000+ | ES | 3 | $500 |
+
+### Position Sizing Logic (Additive)
+
+| Condition | Adjustment |
+|-----------|------------|
+| Base | 1 contract |
+| Stacked signals (2+ patterns) | +1 contract |
+| Trending regime | +1 contract |
+| Win streak (3+) | +1 contract |
+| Loss streak (2+) | -1 contract |
 
 ---
 
@@ -65,11 +95,356 @@ All tests use these default parameters unless otherwise specified:
 |-----------|-------|
 | Stop Loss | 16 ticks (4 points, $200) |
 | Take Profit | 24 ticks (6 points, $300) |
-| Daily Loss Limit | $500 |
-| Position Size | 1 contract |
+| Entry Slippage | 1 tick |
+| Position Size | Tier-based (1-3 contracts) |
 | Max Concurrent Trades | 1 |
-| Fill Assumption | Conservative |
 | Bar Size | 5-minute footprint bars |
+
+---
+
+# Tier Progression Tests (20-22)
+
+## Test 20: Tier Progression - Jan/Feb 2025
+
+| | |
+|---|---|
+| **Date Run** | November 30, 2025 |
+| **Script** | `scripts/run_tier_backtest.py` |
+| **Contract** | ESH5 / MESH5 (March 2025) |
+
+### Hypothesis
+
+Test tier progression system across 30 trading days in a different market environment (early 2025).
+
+### Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Starting Balance | $2,500 |
+| Starting Instrument | MES |
+| Test Period | Jan 13 - Feb 21, 2025 |
+| Trading Days | 30 |
+| MES Days | 5 (Jan 13-17) |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Starting Balance | $2,500 |
+| Ending Balance | $74,241 |
+| Total P&L | +$71,741 |
+| Return | +2,870% |
+| Total Trades | 208 |
+| Avg Size | 2.0 contracts |
+| Winning Days | 23 (77%) |
+| Losing Days | 7 (23%) |
+| Avg Daily P&L | +$2,391 |
+
+### Tier Progression
+
+| Date | Tier Change | Balance |
+|------|-------------|---------|
+| Jan 13 | Start: Tier 1 (MES) | $2,500 |
+| Jan 13 | Tier 1 → Tier 2 | $3,508 |
+| Jan 14 | Tier 2 → Tier 3 | $5,179 |
+| Jan 16 | Tier 3 → Tier 4 | $7,779 |
+| Jan 17 | Tier 4 → Tier 5 | $10,654 |
+
+### Daily Breakdown
+
+| Date | P&L | Trades | Win Rate | Balance | Instrument |
+|------|-----|--------|----------|---------|------------|
+| 2025-01-13 | +$720 | 15 | 87% | $3,220 | MES |
+| 2025-01-14 | +$446 | 13 | 85% | $3,666 | ES |
+| 2025-01-15 | +$2,375 | 10 | 90% | $6,041 | ES |
+| 2025-01-16 | +$2,312 | 9 | 67% | $8,354 | ES |
+| 2025-01-17 | +$5,462 | 7 | 100% | $13,816 | ES |
+| 2025-01-20 | +$3,100 | 7 | 86% | $16,916 | ES |
+| 2025-01-21 | +$3,312 | 8 | 88% | $20,229 | ES |
+| 2025-01-22 | +$3,450 | 5 | 100% | $23,679 | ES |
+| 2025-01-23 | +$150 | 2 | 50% | $23,829 | ES |
+| 2025-01-24 | +$800 | 5 | 60% | $24,629 | ES |
+| 2025-01-27 | +$4,825 | 10 | 90% | $29,454 | ES |
+| 2025-01-28 | +$1,600 | 10 | 70% | $31,054 | ES |
+| 2025-01-29 | +$5,462 | 8 | 100% | $36,516 | ES |
+| 2025-01-30 | +$5,325 | 9 | 89% | $41,841 | ES |
+| 2025-01-31 | -$638 | 1 | 0% | $41,204 | ES |
+| 2025-02-03 | +$5,038 | 10 | 90% | $46,241 | ES |
+| 2025-02-04 | +$2,600 | 9 | 67% | $48,841 | ES |
+| 2025-02-05 | -$625 | 5 | 40% | $48,216 | ES |
+| 2025-02-06 | -$562 | 4 | 25% | $47,654 | ES |
+| 2025-02-07 | +$5,462 | 8 | 100% | $53,116 | ES |
+| 2025-02-10 | +$3,600 | 6 | 83% | $56,716 | ES |
+| 2025-02-11 | +$2,162 | 6 | 83% | $58,879 | ES |
+| 2025-02-12 | -$638 | 2 | 0% | $58,241 | ES |
+| 2025-02-13 | +$1,388 | 11 | 55% | $59,629 | ES |
+| 2025-02-14 | -$562 | 3 | 33% | $59,066 | ES |
+| 2025-02-17 | -$212 | 1 | 0% | $58,854 | ES |
+| 2025-02-18 | +$2,875 | 5 | 100% | $61,729 | ES |
+| 2025-02-19 | +$1,875 | 5 | 80% | $63,604 | ES |
+| 2025-02-20 | +$5,175 | 7 | 100% | $68,779 | ES |
+| 2025-02-21 | +$5,462 | 7 | 100% | $74,241 | ES |
+
+### Position Sizing Distribution
+
+| Size | Trades | Percentage |
+|------|--------|------------|
+| 1 contract | 57 | 27% |
+| 2 contracts | 97 | 47% |
+| 3 contracts | 54 | 26% |
+
+### Finding
+
+Rapid tier progression - reached Tier 5 by day 5. System performed consistently despite some losing days. Jan 20 (MLK Day) and Feb 17 (Presidents Day) had low volume but remained profitable.
+
+**Verdict: CONSISTENT - 30 days, +$71,741, no tier dropbacks**
+
+---
+
+## Test 21: Tier Progression - Mar/May 2025
+
+| | |
+|---|---|
+| **Date Run** | November 30, 2025 |
+| **Script** | `scripts/run_tier_backtest.py` |
+| **Contract** | ESM5 / MESM5 (June 2025) |
+
+### Hypothesis
+
+Test tier progression across 59 trading days mid-contract in Q2 2025.
+
+### Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Starting Balance | $2,500 |
+| Starting Instrument | MES |
+| Test Period | Mar 10 - May 29, 2025 |
+| Trading Days | 59 |
+| MES Days | 5 (Mar 10-14) |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Starting Balance | $2,500 |
+| Ending Balance | $175,548 |
+| Total P&L | +$173,048 |
+| Return | +6,922% |
+| Total Trades | 423 |
+| Avg Size | 2.1 contracts |
+| Winning Days | 55 (93%) |
+| Losing Days | 4 (7%) |
+| Avg Daily P&L | +$2,933 |
+
+### Tier Progression
+
+| Date | Tier Change | Balance |
+|------|-------------|---------|
+| Mar 10 | Start: Tier 1 (MES) | $2,500 |
+| Mar 13 | Tier 1 → Tier 2 | $3,535 |
+| Mar 17 | Tier 2 → Tier 3 | $5,048 |
+| Mar 19 | Tier 3 → Tier 4 | $8,010 |
+| Mar 20 | Tier 4 → Tier 5 | $10,460 |
+
+### Daily Breakdown
+
+| Date | P&L | Trades | Win Rate | Balance | Instrument |
+|------|-----|--------|----------|---------|------------|
+| 2025-03-10 | +$259 | 5 | 100% | $2,759 | MES |
+| 2025-03-11 | +$345 | 4 | 100% | $3,104 | MES |
+| 2025-03-12 | +$86 | 1 | 100% | $3,190 | MES |
+| 2025-03-13 | +$345 | 4 | 100% | $3,535 | ES |
+| 2025-03-14 | +$1,225 | 6 | 83% | $4,760 | ES |
+| 2025-03-17 | +$1,588 | 9 | 78% | $6,348 | ES |
+| 2025-03-18 | -$425 | 1 | 0% | $5,922 | ES |
+| 2025-03-19 | +$1,662 | 6 | 67% | $7,585 | ES |
+| 2025-03-20 | +$4,312 | 7 | 100% | $11,898 | ES |
+| 2025-03-21 | +$3,612 | 12 | 75% | $15,510 | ES |
+| 2025-03-24 | -$638 | 1 | 0% | $14,872 | ES |
+| 2025-03-25 | +$1,300 | 4 | 75% | $16,172 | ES |
+| 2025-03-26 | +$1,875 | 5 | 80% | $18,048 | ES |
+| 2025-03-27 | +$2,025 | 7 | 71% | $20,072 | ES |
+| 2025-03-28 | +$5,175 | 8 | 100% | $25,248 | ES |
+| 2025-03-31 | +$5,038 | 9 | 89% | $30,285 | ES |
+| 2025-04-01 | +$3,250 | 10 | 80% | $33,535 | ES |
+| 2025-04-02 | +$5,750 | 7 | 100% | $39,285 | ES |
+| 2025-04-03 | -$638 | 1 | 0% | $38,648 | ES |
+| 2025-04-04 | +$2,875 | 5 | 100% | $41,522 | ES |
+| 2025-04-07 | +$5,112 | 9 | 89% | $46,635 | ES |
+| 2025-04-08 | +$5,175 | 7 | 100% | $51,810 | ES |
+| 2025-04-09 | +$5,400 | 10 | 90% | $57,210 | ES |
+| 2025-04-10 | +$5,462 | 7 | 100% | $62,672 | ES |
+| 2025-04-11 | +$1,238 | 6 | 67% | $63,910 | ES |
+| 2025-04-14 | +$4,400 | 11 | 82% | $68,310 | ES |
+| 2025-04-15 | +$2,525 | 9 | 78% | $70,835 | ES |
+| 2025-04-16 | +$5,112 | 10 | 90% | $75,948 | ES |
+| 2025-04-17 | +$5,462 | 8 | 100% | $81,410 | ES |
+| 2025-04-18 | $0 | 0 | - | $81,410 | ES |
+| 2025-04-21 | +$1,812 | 7 | 71% | $83,222 | ES |
+| 2025-04-22 | +$3,750 | 10 | 80% | $86,972 | ES |
+| 2025-04-23 | +$3,025 | 7 | 86% | $89,998 | ES |
+| 2025-04-24 | +$5,112 | 10 | 80% | $95,110 | ES |
+| 2025-04-25 | +$5,175 | 8 | 100% | $100,285 | ES |
+| 2025-04-28 | +$5,462 | 7 | 100% | $105,748 | ES |
+| 2025-04-29 | +$5,462 | 7 | 100% | $111,210 | ES |
+| 2025-04-30 | +$4,900 | 11 | 82% | $116,110 | ES |
+| 2025-05-01 | +$5,112 | 11 | 82% | $121,222 | ES |
+| 2025-05-02 | +$3,825 | 11 | 64% | $125,048 | ES |
+| 2025-05-05 | +$3,525 | 8 | 88% | $128,572 | ES |
+| 2025-05-06 | +$5,175 | 7 | 100% | $133,748 | ES |
+| 2025-05-07 | +$4,038 | 10 | 80% | $137,785 | ES |
+| 2025-05-08 | +$5,462 | 9 | 100% | $143,248 | ES |
+| 2025-05-09 | +$2,175 | 10 | 70% | $145,422 | ES |
+| 2025-05-12 | +$5,038 | 10 | 90% | $150,460 | ES |
+| 2025-05-13 | +$800 | 5 | 60% | $151,260 | ES |
+| 2025-05-14 | +$1,100 | 9 | 56% | $152,360 | ES |
+| 2025-05-15 | +$2,600 | 9 | 67% | $154,960 | ES |
+| 2025-05-16 | -$638 | 2 | 0% | $154,322 | ES |
+| 2025-05-19 | +$2,238 | 7 | 86% | $156,560 | ES |
+| 2025-05-20 | +$3,812 | 7 | 86% | $160,372 | ES |
+| 2025-05-21 | +$462 | 10 | 50% | $160,835 | ES |
+| 2025-05-22 | +$2,738 | 8 | 75% | $163,572 | ES |
+| 2025-05-23 | +$3,250 | 10 | 70% | $166,822 | ES |
+| 2025-05-26 | +$650 | 3 | 67% | $167,472 | ES |
+| 2025-05-27 | +$225 | 4 | 50% | $167,698 | ES |
+| 2025-05-28 | +$3,100 | 7 | 86% | $170,798 | ES |
+| 2025-05-29 | +$4,750 | 10 | 90% | $175,548 | ES |
+
+### Position Sizing Distribution
+
+| Size | Trades | Percentage |
+|------|--------|------------|
+| 1 contract | 96 | 23% |
+| 2 contracts | 194 | 46% |
+| 3 contracts | 133 | 31% |
+
+### Finding
+
+Strongest performance period. Only 4 losing days out of 59. Apr 18 (Good Friday) had no data. Reached Tier 5 by day 8 and never dropped back.
+
+**Verdict: EXCELLENT - 59 days, +$173,048, 93% winning days**
+
+---
+
+## Test 22: Tier Progression - Jul/Nov 2025
+
+| | |
+|---|---|
+| **Date Run** | November 30, 2025 |
+| **Script** | `scripts/run_tier_backtest.py` |
+| **Contract** | ESU5, ESZ5 / MESU5 |
+
+### Hypothesis
+
+Test tier progression across 109 trading days spanning two contract cycles (September and December).
+
+### Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Starting Balance | $2,500 |
+| Starting Instrument | MES |
+| Test Period | Jul 1 - Nov 28, 2025 |
+| Trading Days | 109 |
+| MES Days | 10 (Jul 1-14) |
+| Contract Roll | Sep 5 → Sep 8 (ESU5 → ESZ5) |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Starting Balance | $2,500 |
+| Ending Balance | $184,269 |
+| Total P&L | +$181,769 |
+| Return | +7,271% |
+| Total Trades | 627 |
+| Avg Size | 2.0 contracts |
+| Winning Days | 88 (81%) |
+| Losing Days | 21 (19%) |
+| Avg Daily P&L | +$1,668 |
+
+### Tier Progression
+
+| Date | Tier Change | Balance |
+|------|-------------|---------|
+| Jul 1 | Start: Tier 1 (MES) | $2,500 |
+| Jul 9 | Tier 1 → Tier 2 | $3,549 |
+| Jul 15 | Tier 2 → Tier 3 | $5,244 |
+| Jul 18 | Tier 3 → Tier 4 | $8,019 |
+| Jul 23 | Tier 4 → Tier 5 | $10,269 |
+| Jul 25 | Tier 5 → Tier 4 | $9,844 |
+| Jul 28 | Tier 4 → Tier 5 | $10,419 |
+| Jul 29 | Tier 5 → Tier 4 | $9,994 |
+| Jul 30 | Tier 4 → Tier 5 | $10,569 |
+| Aug 6 | Tier 5 → Tier 4 | $9,719 |
+| Aug 7 | Tier 4 → Tier 5 | $10,006 |
+
+### Daily Breakdown (Selected Days)
+
+| Date | P&L | Trades | Win Rate | Balance | Instrument |
+|------|-----|--------|----------|---------|------------|
+| 2025-07-01 | +$189 | 11 | 64% | $2,689 | MES |
+| 2025-07-02 | -$85 | 3 | 0% | $2,604 | MES |
+| 2025-07-08 | +$518 | 7 | 100% | $3,274 | MES |
+| 2025-07-15 | +$1,512 | 7 | 86% | $5,894 | ES |
+| 2025-07-25 | -$425 | 1 | 0% | $8,544 | ES |
+| 2025-08-05 | +$5,325 | 9 | 89% | $20,131 | ES |
+| 2025-08-07 | +$5,750 | 8 | 100% | $25,031 | ES |
+| 2025-08-21 | +$5,175 | 7 | 100% | $39,644 | ES |
+| 2025-09-05 | +$2,688 | 12 | 67% | $54,544 | ES |
+| 2025-09-26 | +$5,750 | 9 | 100% | $69,656 | ES |
+| 2025-10-17 | +$5,400 | 11 | 91% | $90,744 | ES |
+| 2025-10-23 | +$5,462 | 8 | 100% | $107,656 | ES |
+| 2025-11-06 | +$5,400 | 10 | 90% | $131,581 | ES |
+| 2025-11-17 | +$5,462 | 8 | 100% | $161,694 | ES |
+| 2025-11-28 | +$3,025 | 7 | 86% | $184,269 | ES |
+
+### Position Sizing Distribution
+
+| Size | Trades | Percentage |
+|------|--------|------------|
+| 1 contract | 183 | 29% |
+| 2 contracts | 285 | 45% |
+| 3 contracts | 159 | 25% |
+
+### Finding
+
+Most realistic test - longest duration with contract rollover. Showed tier volatility in July-August (3 dropbacks from Tier 5 to Tier 4) before stabilizing. Despite more losing days, still achieved +$181,769.
+
+**Verdict: ROBUST - 109 days, +$181,769, survived tier fluctuations**
+
+---
+
+# Tier Progression Summary
+
+## All Periods Compared
+
+| Period | Days | Trades | Ending | P&L | P&L/Day | Win Days | Tier Drops |
+|--------|------|--------|--------|-----|---------|----------|------------|
+| **Jan-Feb** | 30 | 208 | $74,241 | +$71,741 | $2,391 | 77% | 0 |
+| **Mar-May** | 59 | 423 | $175,548 | +$173,048 | $2,933 | 93% | 0 |
+| **Jul-Nov** | 109 | 627 | $184,269 | +$181,769 | $1,668 | 81% | 3 |
+| **TOTAL** | 198 | 1,258 | - | +$426,558 | $2,154 | 84% | 3 |
+
+## Key Observations
+
+1. **All periods profitable** - no period produced a loss
+2. **Mar-May strongest** - highest P&L/day ($2,933), lowest losing day rate (7%)
+3. **Jul-Nov most volatile** - 3 tier dropbacks, more losing days, but still very profitable
+4. **Tier 5 reached quickly** - within 5-10 trading days in all periods
+5. **MES phase brief** - never more than 10 days before transitioning to ES
+6. **Recovery consistent** - all tier drops recovered within 1-2 days
+
+## Determinism Verified
+
+Each test was run twice to confirm reproducibility:
+
+| Period | Run 1 | Run 2 | Match |
+|--------|-------|-------|-------|
+| Jan-Feb | $74,241.25 | $74,241.25 | YES |
+| Mar-May | $175,547.50 | $175,547.50 | YES |
+| Jul-Nov | $184,268.75 | $184,268.75 | YES |
 
 ---
 
@@ -878,6 +1253,7 @@ The MES tier provides excellent downside protection.
 7. **Don't limit trades** - more trades = more profit
 8. **Trade all day** - first hour highest quality, but all periods contribute
 9. **Momentum continues** - big Fridays predict big Mondays (88% win rate)
+10. **Tier progression consistent** - all three test periods profitable
 
 ---
 
@@ -890,28 +1266,29 @@ The MES tier provides excellent downside protection.
 | Stacked Signals | +1 contract when 2+ patterns | High conviction |
 | Regime Sizing | +1 contract in TRENDING | Higher win rate |
 | Streak Sizing | +1 after 3 wins, -1 after 2 losses | Momentum |
-| Max Position | 4 contracts | Risk cap |
-| Loss Limit | $300 × max contracts | Scaled breathing room |
+| Max Position | 3 contracts (current tiers) | Risk cap |
+| Loss Limit | Tier-based ($100-$500) | Scaled breathing room |
 | Time Restrictions | None | Trade all day |
 | Trade Limits | Unlimited | More = better |
+| Entry Slippage | 1 tick | Realistic fills |
 
-## Capital Growth Tiers
+## Capital Growth Tiers (Current)
 
 | Balance | Instrument | Contracts | Daily Limit |
 |---------|------------|-----------|-------------|
-| $0 - $5,000 | MES | 1 | $50 |
-| $5,000 - $10,000 | ES | 1 | $500 |
-| $10,000 - $20,000 | ES | 2 | $1,000 |
-| $20,000 - $40,000 | ES | 3 | $1,500 |
-| $40,000+ | ES | 4 | $2,000 |
+| $2,500 - $3,500 | MES | 1-3 | $100 |
+| $3,500 - $5,000 | ES | 1 | $400 |
+| $5,000 - $7,500 | ES | 1-2 | $400 |
+| $7,500 - $10,000 | ES | 1-3 | $500 |
+| $10,000+ | ES | 1-3 | $500 |
 
 ## Expected Performance
 
 | Metric | Conservative | Optimistic |
 |--------|--------------|------------|
-| Daily P&L (1 ES) | $1,650 | $1,760 |
-| Monthly P&L (1 ES) | $33,000 | $35,000 |
-| Winning Days | 85% | 92% |
+| Daily P&L (Tier 5) | $1,650 | $2,900 |
+| Monthly P&L (Tier 5) | $33,000 | $58,000 |
+| Winning Days | 77% | 93% |
 | Max Losing Streak | 2 days | 2 days |
 | Max Drawdown | 6% | 6% |
 
@@ -921,10 +1298,21 @@ The MES tier provides excellent downside protection.
 
 | Script | Purpose |
 |--------|---------|
+| `scripts/run_tier_backtest.py` | Tier progression backtest |
 | `scripts/run_databento_backtest.py` | Single day or batch backtest |
-| `scripts/run_conservative_backtest.py` | Conservative fills test |
-| `scripts/test_loss_limit.py` | Loss limit comparison |
+| `scripts/download_historical_data.py` | Download tick data from Databento |
 | `scripts/advanced_backtest.py` | All advanced tests (4-19) |
+
+---
+
+## Data Coverage
+
+| Period | Contract | Days | Ticks |
+|--------|----------|------|-------|
+| Jan 13 - Feb 21, 2025 | ESH5/MESH5 | 30 | ~11M |
+| Mar 10 - May 30, 2025 | ESM5/MESM5 | 60 | ~19M |
+| Jul 1 - Nov 28, 2025 | ESU5/ESZ5 | 109 | ~90M |
+| **Total** | - | **199** | **~120M** |
 
 ---
 

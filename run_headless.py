@@ -72,6 +72,9 @@ from src.data.live_db import (
     log_account_snapshot as db_log_snapshot,
 )
 
+# Heartbeat file for watchdog monitoring
+HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "heartbeat.json")
+
 # Configure logging
 LOG_DIR = os.getenv("LOG_DIR", "/var/log/tradebot")
 if not os.path.exists(LOG_DIR):
@@ -140,6 +143,13 @@ class HeadlessTradingSystem:
         self._open_trade_ids: dict = {}  # bracket_id -> db trade id
         self._db_order_ids: dict = {}  # bracket_id -> db order id (for live mode)
         self._total_commissions: float = 0.0
+
+        # Heartbeat for watchdog monitoring
+        self._last_tick_time: Optional[datetime] = None
+        self._feed_connected: bool = False
+        self._reconnect_count: int = 0
+        self._heartbeat_interval: int = 30  # Write heartbeat every 30 seconds
+        self._last_heartbeat_write: Optional[datetime] = None
 
     async def setup(self) -> bool:
         """Initialize all components."""
@@ -332,6 +342,9 @@ class HeadlessTradingSystem:
 
             logger.info(f"Connected to Rithmic, streaming {self.symbol}")
 
+            # Mark feed as connected for heartbeat
+            self._feed_connected = True
+
             # Create execution bridge for live mode
             if self.mode == "live" and self.manager:
                 self.execution_bridge = ExecutionBridge(
@@ -389,6 +402,10 @@ class HeadlessTradingSystem:
 
             logger.info(f"Starting Databento live feed for {self.symbol}")
             self.data_adapter.start_live(self.symbol)
+
+            # Mark feed as connected for heartbeat
+            self._feed_connected = True
+
             return True
 
         except Exception as e:
@@ -458,6 +475,9 @@ class HeadlessTradingSystem:
                     logger.info(f"Session halted: {self.manager.halt_reason}")
                     await self._on_session_halted()
                     break
+
+                # Write heartbeat even if no ticks (for watchdog monitoring)
+                self._write_heartbeat()
 
                 await asyncio.sleep(1)
 
@@ -566,12 +586,17 @@ class HeadlessTradingSystem:
     def _process_tick(self, tick) -> None:
         """Process incoming tick."""
         self._tick_count += 1
+        self._last_tick_time = datetime.now()
+
         if self.engine:
             self.engine.process_tick(tick)
 
         # Save state periodically
         if self._tick_count % 10000 == 0:
             self._save_state()
+
+        # Write heartbeat for watchdog monitoring
+        self._write_heartbeat()
 
     def _on_bar(self, bar: FootprintBar) -> None:
         """Handle completed bar."""
@@ -747,6 +772,12 @@ class HeadlessTradingSystem:
         """Handle data feed connection."""
         logger.info(f"Data feed connected: {plant_type}")
 
+        # Track connection state for heartbeat
+        if self._feed_connected:
+            # This is a reconnection
+            self._reconnect_count += 1
+        self._feed_connected = True
+
         # Log to database
         if self._db_session_id:
             db_log_connection(
@@ -760,6 +791,9 @@ class HeadlessTradingSystem:
     async def _on_feed_disconnected(self, plant_type: str = "") -> None:
         """Handle data feed disconnection."""
         logger.warning(f"Data feed disconnected: {plant_type}")
+
+        # Track connection state for heartbeat
+        self._feed_connected = False
 
         # Log to database
         if self._db_session_id:
@@ -1188,6 +1222,62 @@ class HeadlessTradingSystem:
         }
 
         self.persistence.save_state(state)
+
+    def _write_heartbeat(self) -> None:
+        """Write heartbeat file for watchdog monitoring."""
+        now = datetime.now()
+
+        # Only write every heartbeat_interval seconds
+        if self._last_heartbeat_write:
+            elapsed = (now - self._last_heartbeat_write).total_seconds()
+            if elapsed < self._heartbeat_interval:
+                return
+
+        try:
+            # Ensure data directory exists
+            os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
+
+            # Gather status info
+            daily_pnl = self.manager.daily_pnl if self.manager else 0
+            trade_count = len(self.manager.completed_trades) if self.manager else 0
+            open_positions = len(self.manager.open_positions) if self.manager else 0
+            is_halted = self.manager.is_halted if self.manager else False
+            halt_reason = self.manager.halt_reason if self.manager else None
+
+            tier_name = None
+            balance = 0
+            if self.tier_manager:
+                tier_name = self.tier_manager.state.tier_name
+                balance = self.tier_manager.state.balance
+
+            heartbeat_data = {
+                "timestamp": now.isoformat(),
+                "last_tick_time": self._last_tick_time.isoformat() if self._last_tick_time else None,
+                "tick_count": self._tick_count,
+                "feed_connected": self._feed_connected,
+                "reconnect_count": self._reconnect_count,
+                "daily_pnl": daily_pnl,
+                "trade_count": trade_count,
+                "open_positions": open_positions,
+                "is_halted": is_halted,
+                "halt_reason": halt_reason,
+                "tier_name": tier_name,
+                "balance": balance,
+                "mode": self.mode,
+                "symbol": self.symbol,
+            }
+
+            # Write atomically
+            import json
+            temp_file = HEARTBEAT_FILE + ".tmp"
+            with open(temp_file, "w") as f:
+                json.dump(heartbeat_data, f, indent=2)
+            os.replace(temp_file, HEARTBEAT_FILE)
+
+            self._last_heartbeat_write = now
+
+        except Exception as e:
+            logger.warning(f"Failed to write heartbeat: {e}")
 
 
 async def main():
