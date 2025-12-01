@@ -3,33 +3,77 @@ Tick Data Logger - Stores live tick data in Parquet format for backtesting.
 
 Design:
 - Accumulates ticks in memory during the trading day
-- At end of day (or on demand), flushes to Parquet file
-- Files organized by date: data/ticks/YYYY-MM-DD.parquet
-- SCP cron job exports to remote server nightly
+- Trading day rolls at 5 PM ET (during daily futures halt 5-6 PM ET)
+- Files organized by trading date: data/ticks/YYYY-MM-DD.parquet
+- A file contains ticks from previous day 5 PM ET to current day 5 PM ET
+- SCP cron job exports to remote server at 5:01 PM ET nightly
 """
 
 import logging
 import os
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from zoneinfo import ZoneInfo
 
 from src.core.types import Tick
 
 logger = logging.getLogger(__name__)
+
+# Trading day rolls at 5 PM ET (17:00) during the daily futures halt
+ROLLOVER_HOUR_ET = 17
+ET_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def get_trading_date(timestamp: datetime) -> str:
+    """
+    Get the trading date for a given timestamp.
+
+    Trading day rolls at 5 PM ET. Ticks before 5 PM belong to that calendar day.
+    Ticks at or after 5 PM belong to the NEXT calendar day.
+
+    Examples (all times ET):
+        - 2025-12-01 09:30:00 -> "2025-12-01" (Monday morning -> Monday's file)
+        - 2025-12-01 16:59:59 -> "2025-12-01" (Before 5 PM -> Monday's file)
+        - 2025-12-01 17:00:00 -> "2025-12-02" (At 5 PM -> Tuesday's file)
+        - 2025-12-01 23:30:00 -> "2025-12-02" (Evening -> Tuesday's file)
+
+    Args:
+        timestamp: UTC or timezone-aware datetime
+
+    Returns:
+        Trading date string in YYYY-MM-DD format
+    """
+    # Convert to ET
+    if timestamp.tzinfo is None:
+        # Assume UTC if no timezone
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    et_time = timestamp.astimezone(ET_TIMEZONE)
+
+    # If at or after 5 PM ET, this tick belongs to the next calendar day's file
+    if et_time.hour >= ROLLOVER_HOUR_ET:
+        trading_date = et_time.date() + timedelta(days=1)
+    else:
+        trading_date = et_time.date()
+
+    return trading_date.strftime("%Y-%m-%d")
 
 
 class TickLogger:
     """
     In-memory tick accumulator with Parquet persistence.
 
+    Trading day rolls at 5 PM ET to align with futures daily halt (5-6 PM ET).
+    Files are named by trading date, containing ticks from previous 5 PM to current 5 PM.
+
     Usage:
         logger = TickLogger()
         logger.log_tick(tick)  # Called for each tick
-        logger.flush()         # Called at end of day to persist
+        logger.flush()         # Called at 5 PM ET to persist
     """
 
     # Parquet schema for tick data
@@ -68,16 +112,16 @@ class TickLogger:
         Args:
             tick: Tick data to log
         """
-        # Get date string for partitioning
-        date_str = tick.timestamp.strftime("%Y-%m-%d")
+        # Get trading date (rolls at 5 PM ET)
+        trading_date = get_trading_date(tick.timestamp)
 
-        # Check if we crossed into a new day
-        if self._current_date and date_str != self._current_date:
-            # Auto-flush previous day's data
-            logger.info(f"Date changed from {self._current_date} to {date_str}, flushing old data")
+        # Check if we crossed into a new trading day (5 PM ET rollover)
+        if self._current_date and trading_date != self._current_date:
+            # Auto-flush previous trading day's data
+            logger.info(f"Trading day rolled from {self._current_date} to {trading_date} (5 PM ET), flushing old data")
             self.flush(self._current_date)
 
-        self._current_date = date_str
+        self._current_date = trading_date
 
         # Convert tick to dict for storage
         tick_dict = {

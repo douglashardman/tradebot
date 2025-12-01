@@ -1,7 +1,7 @@
 # CLAUDE.md - Order Flow Trading System
 
 > This file provides Claude with comprehensive context about the tradebot project.
-> Last updated: 2025-12-01 (production deployment complete)
+> Last updated: 2025-12-01 (tick data rollover at 5 PM ET)
 
 ## Quick Reference
 
@@ -222,10 +222,16 @@ The system handles restarts gracefully:
 
 ## Tick Data Export & Daily Recap
 
-Automated nightly export to home server:
-- **Schedule**: 11:01 PM ET, Mon-Fri (cron under tradebot user)
+Automated export to home server during daily futures halt:
+- **Schedule**: 5:01 PM ET, Mon-Fri (cron under tradebot user)
 - **Destination**: faded-vibes@99.69.168.225:/home/faded-vibes/tradebot/data/tick_cache/
 - **SSH Key**: /home/tradebot/.ssh/tradebot_sync
+
+### Trading Day Rollover
+Tick data files roll at **5 PM ET** (during daily halt) instead of midnight:
+- Aligns with futures trading day (6 PM - 5 PM ET)
+- A trading day file contains: previous day 5 PM ET → current day 5 PM ET
+- Export runs at 5:01 PM ET, just after rollover
 
 ### Files Exported
 | File | Format | Contents |
