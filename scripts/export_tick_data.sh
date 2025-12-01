@@ -113,3 +113,27 @@ fi
 
 echo "Export complete"
 echo ""
+
+# Generate and export daily recap
+echo "=========================================="
+echo "Daily Recap - $(date)"
+echo "=========================================="
+
+echo "Generating daily recap..."
+${VENV_PYTHON} "${TRADEBOT_DIR}/scripts/daily_recap.py" --quiet
+
+RECAP_FILE="${TRADEBOT_DIR}/data/recaps/${TODAY}_recap.json"
+
+if [[ -f "${RECAP_FILE}" ]]; then
+    echo "Uploading recap to ${DEST}..."
+    if scp ${SCP_OPTS} "${RECAP_FILE}" "${DEST}"; then
+        echo "SUCCESS: Uploaded ${TODAY}_recap.json to ${TICK_EXPORT_HOST}"
+    else
+        echo "WARNING: Failed to upload recap"
+    fi
+else
+    echo "WARNING: Recap file not found"
+fi
+
+echo "All exports complete"
+echo ""

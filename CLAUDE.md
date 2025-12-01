@@ -220,13 +220,36 @@ The system handles restarts gracefully:
 - No manual intervention needed for reboots/crashes
 - Trades and P&L tracked continuously within the day
 
-## Tick Data Export
+## Tick Data Export & Daily Recap
 
 Automated nightly export to home server:
 - **Schedule**: 11:01 PM ET, Mon-Fri (cron under tradebot user)
 - **Destination**: faded-vibes@99.69.168.225:/home/faded-vibes/tradebot/data/tick_cache/
 - **SSH Key**: /home/tradebot/.ssh/tradebot_sync
-- **Format**: Parquet files (YYYY-MM-DD.parquet)
+
+### Files Exported
+| File | Format | Contents |
+|------|--------|----------|
+| `YYYY-MM-DD.parquet` | Parquet | Raw tick data (symbol, price, size, side, timestamp) |
+| `YYYY-MM-DD_recap.json` | JSON | Daily session summary (see below) |
+
+### Daily Recap Contents
+The recap JSON includes:
+- **Session info**: mode, symbol, tier, status
+- **Heartbeat stats**: tick count, bar count, signal count, P&L
+- **All signals**: detected signals with strength and accept/reject status
+- **All bars**: completed 5-min bars with OHLC, volume, delta
+- **Trades**: entry/exit prices, P&L, duration
+- **Errors/warnings**: any issues from the day
+
+### Manual Recap Generation
+```bash
+# Generate recap for today
+sudo -u tradebot /opt/tradebot/venv/bin/python /opt/tradebot/scripts/daily_recap.py
+
+# Generate recap for specific date (no export)
+sudo -u tradebot /opt/tradebot/venv/bin/python /opt/tradebot/scripts/daily_recap.py --date 2025-12-01 --no-export
+```
 
 ## Watchdog Monitor
 
