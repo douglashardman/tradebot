@@ -132,7 +132,7 @@ class TickLogger:
             "side": tick.side,
         }
 
-        self._ticks[date_str].append(tick_dict)
+        self._ticks[trading_date].append(tick_dict)
         self._tick_count += 1
 
         # Log progress periodically
