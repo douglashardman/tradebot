@@ -187,7 +187,8 @@ class HeadlessTradingSystem:
                 message=f"Market closed ({reason}). System will try again tomorrow.",
                 alert_type=AlertType.INFO,
             )
-            return False
+            # Exit with code 0 so systemd doesn't restart (this is expected, not a failure)
+            sys.exit(0)
 
         # Initialize tier manager for capital progression
         starting_balance = float(os.getenv("STARTING_BALANCE", "2500"))
@@ -345,6 +346,11 @@ class HeadlessTradingSystem:
             # Mark feed as connected for heartbeat
             self._feed_connected = True
 
+            # Check margin requirements before trading
+            margin_ok = await self._check_margin_requirements()
+            if not margin_ok:
+                return False
+
             # Create execution bridge for live mode
             if self.mode == "live" and self.manager:
                 self.execution_bridge = ExecutionBridge(
@@ -415,6 +421,105 @@ class HeadlessTradingSystem:
                 str(e),
             )
             return False
+
+    async def _check_margin_requirements(self) -> bool:
+        """
+        Check if margin requirements are within acceptable limits.
+
+        High margin days (FOMC, elections, etc.) can spike margins from
+        normal levels ($50 MES, $300 ES) to $2000+. We don't trade those days.
+
+        Returns:
+            True if margins are acceptable, False if too high.
+        """
+        # Margin thresholds - don't trade if above these
+        # Normal margins: MES=$40, ES=$300 (dashboard shows $300 but using $400 as buffer)
+        MARGIN_LIMITS = {
+            "MES": float(os.getenv("MES_MARGIN_LIMIT", "40")),
+            "MESM": float(os.getenv("MES_MARGIN_LIMIT", "40")),  # Contract month variants
+            "MESH": float(os.getenv("MES_MARGIN_LIMIT", "40")),
+            "MESU": float(os.getenv("MES_MARGIN_LIMIT", "40")),
+            "MESZ": float(os.getenv("MES_MARGIN_LIMIT", "40")),
+            "ES": float(os.getenv("ES_MARGIN_LIMIT", "400")),
+            "ESM": float(os.getenv("ES_MARGIN_LIMIT", "400")),
+            "ESH": float(os.getenv("ES_MARGIN_LIMIT", "400")),
+            "ESU": float(os.getenv("ES_MARGIN_LIMIT", "400")),
+            "ESZ": float(os.getenv("ES_MARGIN_LIMIT", "400")),
+        }
+
+        if not self.data_adapter:
+            logger.warning("No data adapter - skipping margin check")
+            return True
+
+        # Get the base symbol (strip contract month if present)
+        base_symbol = self.symbol[:3] if len(self.symbol) > 2 else self.symbol
+        if base_symbol.startswith("MES"):
+            base_symbol = "MES"
+        elif base_symbol.startswith("ES"):
+            base_symbol = "ES"
+
+        # Get margin limit for this symbol
+        margin_limit = MARGIN_LIMITS.get(self.symbol) or MARGIN_LIMITS.get(base_symbol)
+        if not margin_limit:
+            logger.warning(f"No margin limit configured for {self.symbol} - allowing trade")
+            return True
+
+        try:
+            # Query current margin from Rithmic
+            current_margin = await self.data_adapter.get_margin_requirement(self.symbol, "CME")
+
+            if current_margin is None:
+                # Can't determine margin - check if we should fail safe
+                fail_safe = os.getenv("MARGIN_CHECK_FAIL_SAFE", "false").lower() == "true"
+                if fail_safe:
+                    logger.warning(f"Could not query margin for {self.symbol} - fail safe enabled, not trading")
+                    await self.notifications.send_alert(
+                        title="⚠️ Margin Check Failed",
+                        message=(
+                            f"Could not query margin requirement for {self.symbol}.\n"
+                            f"Fail-safe mode enabled - not trading today.\n\n"
+                            f"Set MARGIN_CHECK_FAIL_SAFE=false to trade anyway."
+                        ),
+                        alert_type=AlertType.WARNING,
+                    )
+                    return False
+                else:
+                    logger.warning(f"Could not query margin for {self.symbol} - proceeding anyway")
+                    return True
+
+            logger.info(f"Current margin for {self.symbol}: ${current_margin:.2f} (limit: ${margin_limit:.2f})")
+
+            if current_margin > margin_limit:
+                logger.warning(f"Margin too high! ${current_margin:.2f} > ${margin_limit:.2f} limit")
+                await self.notifications.send_alert(
+                    title="🚫 High Margin Day - Not Trading",
+                    message=(
+                        f"**Symbol:** {self.symbol}\n"
+                        f"**Current Margin:** ${current_margin:.2f}\n"
+                        f"**Normal Limit:** ${margin_limit:.2f}\n\n"
+                        f"Margins are elevated (likely FOMC, CPI, elections, etc.).\n"
+                        f"System will not trade today to avoid margin calls."
+                    ),
+                    alert_type=AlertType.WARNING,
+                )
+                # Exit cleanly - this is expected behavior, not a failure
+                sys.exit(0)
+
+            logger.info(f"Margin check passed: ${current_margin:.2f} <= ${margin_limit:.2f}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error checking margin: {e}")
+            # On error, allow trading unless fail-safe is enabled
+            fail_safe = os.getenv("MARGIN_CHECK_FAIL_SAFE", "false").lower() == "true"
+            if fail_safe:
+                await self.notifications.send_alert(
+                    title="⚠️ Margin Check Error",
+                    message=f"Error checking margin: {e}\n\nFail-safe enabled - not trading.",
+                    alert_type=AlertType.ERROR,
+                )
+                return False
+            return True
 
     async def run(self) -> None:
         """Main run loop."""

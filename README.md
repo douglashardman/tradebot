@@ -135,7 +135,21 @@ TRADING_SYMBOL=MES
 TRADING_MODE=paper  # paper or live
 DAILY_PROFIT_TARGET=500
 DAILY_LOSS_LIMIT=-300
+
+# Margin protection (optional - uses these defaults)
+MES_MARGIN_LIMIT=40    # Won't trade MES if margin > $40
+ES_MARGIN_LIMIT=400    # Won't trade ES if margin > $400
 ```
+
+### Margin Protection
+
+The system automatically checks margin requirements before trading. On high-volatility days (FOMC, CPI, elections), brokers increase margins significantly. When margins exceed the configured limits, the system will:
+
+1. Send a Discord alert explaining why it's not trading
+2. Exit cleanly without attempting trades
+3. Retry on the next trading day
+
+Normal margins: MES=$40, ES=$300. The system uses $40/$400 as thresholds to provide a buffer.
 
 ### Trading Modes
 
@@ -150,25 +164,52 @@ DAILY_LOSS_LIMIT=-300
 
 | Event | Notification |
 |-------|--------------|
+| System reboot | Server restarted alert |
 | System start | Session config and start time |
+| High margin day | Not trading due to elevated margins |
 | Trade opened | Entry, stop, target prices |
 | Trade closed | P&L and exit reason |
+| Tier change | Account promoted/demoted to new tier |
 | Connection lost | Alert with timestamp |
 | Connection restored | Confirmation |
 | Loss limit hit | Session halted alert |
 | Profit target hit | Success notification |
 | 3:55 PM | Auto-flatten notification |
 | 4:00 PM | Full daily digest with stats |
+| Watchdog alerts | System health issues (stale heartbeat, etc.) |
 
 ### Service Commands
 
 ```bash
+# Main trading service
+sudo systemctl start tradebot
+sudo systemctl stop tradebot
+sudo systemctl restart tradebot
+sudo journalctl -u tradebot -f          # View logs
+
+# Watchdog health monitor
+sudo systemctl start tradebot-watchdog
+sudo systemctl status tradebot-watchdog
+sudo journalctl -u tradebot-watchdog -f
+
+# Deploy script (alternative)
 sudo ./scripts/deploy_headless.sh --start    # Start
 sudo ./scripts/deploy_headless.sh --stop     # Stop
 sudo ./scripts/deploy_headless.sh --restart  # Restart
 sudo ./scripts/deploy_headless.sh --logs     # View logs
 sudo ./scripts/deploy_headless.sh --update   # Pull latest & restart
 ```
+
+### Watchdog Monitor
+
+A separate watchdog process monitors system health and sends alerts:
+
+- **Heartbeat monitoring**: Alerts if main process stops updating
+- **Memory/disk checks**: Warns on resource issues
+- **Connection tracking**: Monitors feed reconnects
+- **Daily summary**: EOD health report
+
+The watchdog runs as `tradebot-watchdog.service` and reads heartbeat data from `data/heartbeat.json`.
 
 ### Health Check (No Port Needed)
 

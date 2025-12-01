@@ -421,6 +421,53 @@ class RithmicAdapter:
             logger.warning(f"Failed to query account balance: {e}")
             return None
 
+    async def get_margin_requirement(self, symbol: str, exchange: str = "CME") -> Optional[float]:
+        """
+        Query initial margin requirement for a symbol from Rithmic.
+
+        Args:
+            symbol: Trading symbol (e.g., "MES", "ES")
+            exchange: Exchange code (default: "CME")
+
+        Returns:
+            Initial margin requirement in dollars per contract, or None if query fails.
+        """
+        if not self.client or not self._connected:
+            logger.warning("Cannot query margin: not connected to Rithmic")
+            return None
+
+        try:
+            # Try to get margin info from Rithmic
+            # The exact method depends on async_rithmic version
+            if hasattr(self.client, 'get_product_margin'):
+                margin_data = await self.client.get_product_margin(symbol, exchange)
+                if margin_data:
+                    # Return initial margin (day trading margin)
+                    return float(margin_data.get('initial_margin', margin_data.get('day_margin', 0)))
+
+            # Alternative: get_reference_data may include margin info
+            if hasattr(self.client, 'get_reference_data'):
+                ref_data = await self.client.get_reference_data(symbol, exchange)
+                if ref_data and 'margin' in ref_data:
+                    return float(ref_data['margin'])
+
+            # Alternative: search_symbols may include margin info
+            if hasattr(self.client, 'search_symbols'):
+                results = await self.client.search_symbols(symbol, exchange)
+                if results:
+                    for result in results:
+                        if result.get('symbol') == symbol:
+                            margin = result.get('initial_margin') or result.get('margin')
+                            if margin:
+                                return float(margin)
+
+            logger.debug(f"Margin query not supported for {symbol}")
+            return None
+
+        except Exception as e:
+            logger.warning(f"Failed to query margin for {symbol}: {e}")
+            return None
+
     def on_account_update(self, callback: Callable) -> None:
         """
         Register callback for account updates (balance changes, fills, etc.).
