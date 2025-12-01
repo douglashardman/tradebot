@@ -1,0 +1,25 @@
+[Unit]
+Description=Send Discord notification on system reboot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/tradebot
+Environment="PATH=/opt/tradebot/venv/bin:/usr/bin"
+ExecStart=/opt/tradebot/venv/bin/python /opt/tradebot/scripts/reboot_notify.py
+RemainAfterExit=no
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tradebot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

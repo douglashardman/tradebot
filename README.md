@@ -137,19 +137,22 @@ DAILY_PROFIT_TARGET=500
 DAILY_LOSS_LIMIT=-300
 
 # Margin protection (optional - uses these defaults)
-MES_MARGIN_LIMIT=40    # Won't trade MES if margin > $40
-ES_MARGIN_LIMIT=400    # Won't trade ES if margin > $400
+MES_MARGIN_LIMIT=50    # Pause trading if MES margin > $50
+ES_MARGIN_LIMIT=500    # Pause trading if ES margin > $500
 ```
 
 ### Margin Protection
 
-The system automatically checks margin requirements before trading. On high-volatility days (FOMC, CPI, elections), brokers increase margins significantly. When margins exceed the configured limits, the system will:
+The system checks margin requirements before each trade. On high-volatility periods (FOMC, CPI, elections), brokers temporarily increase margins. When margins exceed the configured limits:
 
-1. Send a Discord alert explaining why it's not trading
-2. Exit cleanly without attempting trades
-3. Retry on the next trading day
+1. New trades are paused (existing positions unaffected)
+2. Discord alert sent when margins spike
+3. Discord alert sent when margins normalize
+4. Trading resumes automatically when margins return to normal
 
-Normal margins: MES=$40, ES=$300. The system uses $40/$400 as thresholds to provide a buffer.
+This handles temporary margin spikes (e.g., 9:30am-12pm during Fed announcements) without shutting down the entire day.
+
+Normal margins: MES ~$40, ES ~$300. The system uses $50/$500 as thresholds to provide a buffer.
 
 ### Trading Modes
 

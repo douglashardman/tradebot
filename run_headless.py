@@ -151,6 +151,11 @@ class HeadlessTradingSystem:
         self._heartbeat_interval: int = 30  # Write heartbeat every 30 seconds
         self._last_heartbeat_write: Optional[datetime] = None
 
+        # Margin tracking - alert once when high, once when normal
+        self._margin_is_high: bool = False
+        self._last_margin_check: Optional[datetime] = None
+        self._margin_check_interval: int = 60  # Check at most every 60 seconds
+
     async def setup(self) -> bool:
         """Initialize all components."""
         logger.info("=" * 60)
@@ -346,11 +351,6 @@ class HeadlessTradingSystem:
             # Mark feed as connected for heartbeat
             self._feed_connected = True
 
-            # Check margin requirements before trading
-            margin_ok = await self._check_margin_requirements()
-            if not margin_ok:
-                return False
-
             # Create execution bridge for live mode
             if self.mode == "live" and self.manager:
                 self.execution_bridge = ExecutionBridge(
@@ -426,100 +426,79 @@ class HeadlessTradingSystem:
         """
         Check if margin requirements are within acceptable limits.
 
-        High margin days (FOMC, elections, etc.) can spike margins from
-        normal levels ($50 MES, $300 ES) to $2000+. We don't trade those days.
+        Called before each trade. High margin periods (FOMC, CPI, etc.) can
+        spike margins temporarily. We skip trading during those periods but
+        keep running - margins usually normalize within hours.
 
         Returns:
             True if margins are acceptable, False if too high.
         """
+        # Rate limit margin checks to avoid hammering the broker
+        now = datetime.now()
+        if self._last_margin_check:
+            elapsed = (now - self._last_margin_check).total_seconds()
+            if elapsed < self._margin_check_interval:
+                # Use cached state
+                return not self._margin_is_high
+        self._last_margin_check = now
+
         # Margin thresholds - don't trade if above these
-        # Normal margins: MES=$40, ES=$300 (dashboard shows $300 but using $400 as buffer)
-        MARGIN_LIMITS = {
-            "MES": float(os.getenv("MES_MARGIN_LIMIT", "40")),
-            "MESM": float(os.getenv("MES_MARGIN_LIMIT", "40")),  # Contract month variants
-            "MESH": float(os.getenv("MES_MARGIN_LIMIT", "40")),
-            "MESU": float(os.getenv("MES_MARGIN_LIMIT", "40")),
-            "MESZ": float(os.getenv("MES_MARGIN_LIMIT", "40")),
-            "ES": float(os.getenv("ES_MARGIN_LIMIT", "400")),
-            "ESM": float(os.getenv("ES_MARGIN_LIMIT", "400")),
-            "ESH": float(os.getenv("ES_MARGIN_LIMIT", "400")),
-            "ESU": float(os.getenv("ES_MARGIN_LIMIT", "400")),
-            "ESZ": float(os.getenv("ES_MARGIN_LIMIT", "400")),
-        }
+        MES_LIMIT = float(os.getenv("MES_MARGIN_LIMIT", "50"))
+        ES_LIMIT = float(os.getenv("ES_MARGIN_LIMIT", "500"))
 
         if not self.data_adapter:
-            logger.warning("No data adapter - skipping margin check")
             return True
 
-        # Get the base symbol (strip contract month if present)
-        base_symbol = self.symbol[:3] if len(self.symbol) > 2 else self.symbol
-        if base_symbol.startswith("MES"):
-            base_symbol = "MES"
-        elif base_symbol.startswith("ES"):
-            base_symbol = "ES"
-
-        # Get margin limit for this symbol
-        margin_limit = MARGIN_LIMITS.get(self.symbol) or MARGIN_LIMITS.get(base_symbol)
-        if not margin_limit:
-            logger.warning(f"No margin limit configured for {self.symbol} - allowing trade")
-            return True
+        # Get the base symbol
+        base_symbol = "MES" if "MES" in self.symbol else "ES"
+        margin_limit = MES_LIMIT if base_symbol == "MES" else ES_LIMIT
 
         try:
-            # Query current margin from Rithmic
             current_margin = await self.data_adapter.get_margin_requirement(self.symbol, "CME")
 
             if current_margin is None:
-                # Can't determine margin - check if we should fail safe
-                fail_safe = os.getenv("MARGIN_CHECK_FAIL_SAFE", "false").lower() == "true"
-                if fail_safe:
-                    logger.warning(f"Could not query margin for {self.symbol} - fail safe enabled, not trading")
-                    await self.notifications.send_alert(
-                        title="⚠️ Margin Check Failed",
-                        message=(
-                            f"Could not query margin requirement for {self.symbol}.\n"
-                            f"Fail-safe mode enabled - not trading today.\n\n"
-                            f"Set MARGIN_CHECK_FAIL_SAFE=false to trade anyway."
-                        ),
-                        alert_type=AlertType.WARNING,
-                    )
-                    return False
-                else:
-                    logger.warning(f"Could not query margin for {self.symbol} - proceeding anyway")
-                    return True
+                # Can't query - use cached state or allow trade
+                return not self._margin_is_high
 
-            logger.info(f"Current margin for {self.symbol}: ${current_margin:.2f} (limit: ${margin_limit:.2f})")
+            margin_high = current_margin > margin_limit
 
-            if current_margin > margin_limit:
-                logger.warning(f"Margin too high! ${current_margin:.2f} > ${margin_limit:.2f} limit")
+            # State transition: normal -> high
+            if margin_high and not self._margin_is_high:
+                self._margin_is_high = True
+                logger.warning(f"Margins elevated: ${current_margin:.2f} > ${margin_limit:.2f} limit")
                 await self.notifications.send_alert(
-                    title="🚫 High Margin Day - Not Trading",
+                    title="⚠️ High Margins - Pausing Trades",
                     message=(
                         f"**Symbol:** {self.symbol}\n"
                         f"**Current Margin:** ${current_margin:.2f}\n"
                         f"**Normal Limit:** ${margin_limit:.2f}\n\n"
-                        f"Margins are elevated (likely FOMC, CPI, elections, etc.).\n"
-                        f"System will not trade today to avoid margin calls."
+                        f"Skipping new trades until margins normalize.\n"
+                        f"Existing positions are unaffected."
                     ),
                     alert_type=AlertType.WARNING,
                 )
-                # Exit cleanly - this is expected behavior, not a failure
-                sys.exit(0)
+                return False
 
-            logger.info(f"Margin check passed: ${current_margin:.2f} <= ${margin_limit:.2f}")
-            return True
+            # State transition: high -> normal
+            if not margin_high and self._margin_is_high:
+                self._margin_is_high = False
+                logger.info(f"Margins normalized: ${current_margin:.2f} <= ${margin_limit:.2f}")
+                await self.notifications.send_alert(
+                    title="✅ Margins Normalized - Resuming Trades",
+                    message=(
+                        f"**Symbol:** {self.symbol}\n"
+                        f"**Current Margin:** ${current_margin:.2f}\n\n"
+                        f"Margins are back to normal. Trading resumed."
+                    ),
+                    alert_type=AlertType.SUCCESS,
+                )
+                return True
+
+            return not self._margin_is_high
 
         except Exception as e:
-            logger.error(f"Error checking margin: {e}")
-            # On error, allow trading unless fail-safe is enabled
-            fail_safe = os.getenv("MARGIN_CHECK_FAIL_SAFE", "false").lower() == "true"
-            if fail_safe:
-                await self.notifications.send_alert(
-                    title="⚠️ Margin Check Error",
-                    message=f"Error checking margin: {e}\n\nFail-safe enabled - not trading.",
-                    alert_type=AlertType.ERROR,
-                )
-                return False
-            return True
+            logger.warning(f"Margin check error: {e}")
+            return not self._margin_is_high  # Use cached state on error
 
     async def run(self) -> None:
         """Main run loop."""
@@ -726,74 +705,87 @@ class HeadlessTradingSystem:
         signal = self.router.evaluate_signal(signal)
 
         if signal.approved and not self.dry_run:
-            # Count stacked signals (same direction signals in current bar)
-            stacked_count = sum(
-                1 for s in self._current_bar_signals
-                if s.direction == signal.direction
+            # Check margin requirements before trading (async check)
+            asyncio.create_task(self._execute_signal_with_margin_check(signal))
+
+    async def _execute_signal_with_margin_check(self, signal: Signal) -> None:
+        """Execute signal after checking margin requirements."""
+        # Check margins (rate-limited, alerts on state change)
+        if not await self._check_margin_requirements():
+            logger.info(f"Signal skipped due to high margins: {signal.pattern}")
+            return
+
+        if not self.router or not self.manager:
+            return
+
+        # Count stacked signals (same direction signals in current bar)
+        stacked_count = sum(
+            1 for s in self._current_bar_signals
+            if s.direction == signal.direction
+        )
+
+        # Use tier manager for position sizing (combined logic)
+        current_regime = self.router.current_regime if self.router else "UNKNOWN"
+        if self.tier_manager:
+            position_size = self.tier_manager.get_position_size(
+                regime=current_regime,
+                stacked_count=stacked_count,
+                use_streaks=True,
+            )
+        else:
+            # Fallback to router multiplier if no tier manager
+            position_size = int(self.router.get_position_size_multiplier())
+
+        # Capture context BEFORE executing (for database logging)
+        self._pending_trade_context = {
+            "pattern": signal.pattern,
+            "signal_strength": getattr(signal, "strength", 0),
+            "regime": current_regime,
+            "regime_score": getattr(self.router, "regime_score", None),
+            "stacked_count": stacked_count,
+            "tier_index": self.tier_manager.state.tier_index if self.tier_manager else 0,
+            "tier_name": self.tier_manager.state.tier_name if self.tier_manager else None,
+            "instrument": self.tier_manager.state.instrument if self.tier_manager else self.symbol,
+            "win_streak": self.tier_manager.state.win_streak if self.tier_manager else 0,
+            "loss_streak": self.tier_manager.state.loss_streak if self.tier_manager else 0,
+        }
+
+        order = self.manager.on_signal(signal, absolute_size=position_size)
+
+        if order:
+            logger.info(
+                f"Order: {order.side} {order.size} @ {order.entry_price} "
+                f"(stacked={stacked_count}, regime={current_regime})"
             )
 
-            # Use tier manager for position sizing (combined logic)
-            current_regime = self.router.current_regime if self.router else "UNKNOWN"
-            if self.tier_manager:
-                position_size = self.tier_manager.get_position_size(
-                    regime=current_regime,
-                    stacked_count=stacked_count,
-                    use_streaks=True,
-                )
-            else:
-                # Fallback to router multiplier if no tier manager
-                position_size = int(self.router.get_position_size_multiplier())
-
-            # Capture context BEFORE executing (for database logging)
-            self._pending_trade_context = {
-                "pattern": signal.pattern,
-                "signal_strength": getattr(signal, "strength", 0),
-                "regime": current_regime,
-                "regime_score": getattr(self.router, "regime_score", None),
-                "stacked_count": stacked_count,
-                "tier_index": self.tier_manager.state.tier_index if self.tier_manager else 0,
-                "tier_name": self.tier_manager.state.tier_name if self.tier_manager else None,
-                "instrument": self.tier_manager.state.instrument if self.tier_manager else self.symbol,
-                "win_streak": self.tier_manager.state.win_streak if self.tier_manager else 0,
-                "loss_streak": self.tier_manager.state.loss_streak if self.tier_manager else 0,
-            }
-
-            order = self.manager.on_signal(signal, absolute_size=position_size)
-
-            if order:
-                logger.info(
-                    f"Order: {order.side} {order.size} @ {order.entry_price} "
-                    f"(stacked={stacked_count}, regime={current_regime})"
-                )
-
-                # In live mode, submit the order through the execution bridge
-                if self.mode == "live" and self.execution_bridge:
-                    # Log order to database before submission
-                    if self._db_session_id:
-                        db_order_id = db_log_order(
-                            session_id=self._db_session_id,
-                            internal_order_id=order.bracket_id,
-                            symbol=order.symbol,
-                            side=order.side,
-                            order_type="BRACKET",
-                            size=order.size,
-                            bracket_id=order.bracket_id,
-                            expected_price=order.entry_price,
-                            stop_price=order.stop_price,
-                        )
-                        # Track DB order ID for fill/rejection updates
-                        self._db_order_ids[order.bracket_id] = db_order_id
-
-                    # Remove from pending_orders (we're submitting directly)
-                    if order in self.manager.pending_orders:
-                        self.manager.pending_orders.remove(order)
-
-                    # Submit to broker asynchronously with retry logic and tracking
-                    # Uses _submit_and_track to record success/failure in bridge
-                    task = asyncio.create_task(
-                        self.execution_bridge._submit_and_track(order)
+            # In live mode, submit the order through the execution bridge
+            if self.mode == "live" and self.execution_bridge:
+                # Log order to database before submission
+                if self._db_session_id:
+                    db_order_id = db_log_order(
+                        session_id=self._db_session_id,
+                        internal_order_id=order.bracket_id,
+                        symbol=order.symbol,
+                        side=order.side,
+                        order_type="BRACKET",
+                        size=order.size,
+                        bracket_id=order.bracket_id,
+                        expected_price=order.entry_price,
+                        stop_price=order.stop_price,
                     )
-                    self.execution_bridge._submission_tasks[order.bracket_id] = task
+                    # Track DB order ID for fill/rejection updates
+                    self._db_order_ids[order.bracket_id] = db_order_id
+
+                # Remove from pending_orders (we're submitting directly)
+                if order in self.manager.pending_orders:
+                    self.manager.pending_orders.remove(order)
+
+                # Submit to broker asynchronously with retry logic and tracking
+                # Uses _submit_and_track to record success/failure in bridge
+                task = asyncio.create_task(
+                    self.execution_bridge._submit_and_track(order)
+                )
+                self.execution_bridge._submission_tasks[order.bracket_id] = task
 
     def _on_trade_complete(self, trade) -> None:
         """Handle completed trade - send Discord alert and update tier manager."""
