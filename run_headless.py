@@ -60,7 +60,7 @@ from src.core.capital import (
 )
 from src.execution.bridge import ExecutionBridge
 from src.data.live_db import (
-    create_session as db_create_session,
+    get_or_create_session as db_get_or_create_session,
     end_session as db_end_session,
     log_order as db_log_order,
     update_order_filled as db_update_order_filled,
@@ -238,9 +238,9 @@ class HeadlessTradingSystem:
         self.manager.on_trade(self._on_trade_complete)
         self.manager.on_position(self._on_position_opened)
 
-        # Create database session for logging
+        # Get or create database session for logging (handles restarts gracefully)
         today = datetime.now().strftime("%Y-%m-%d")
-        self._db_session_id = db_create_session(
+        self._db_session_id = db_get_or_create_session(
             date=today,
             mode=self.mode,
             symbol=self.symbol,
@@ -252,7 +252,7 @@ class HeadlessTradingSystem:
             take_profit_ticks=self.session.take_profit_ticks,
             daily_loss_limit=tier_config["daily_loss_limit"],
         )
-        logger.info(f"Created database session #{self._db_session_id}")
+        logger.info(f"Using database session #{self._db_session_id}")
 
         # Create order flow engine
         self.engine = OrderFlowEngine({

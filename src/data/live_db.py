@@ -701,6 +701,43 @@ def get_session_by_date(date: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
+def get_or_create_session(
+    date: str,
+    mode: str,
+    symbol: str,
+    contract: str = None,
+    tier_index: int = None,
+    tier_name: str = None,
+    starting_balance: float = None,
+    max_position_size: int = None,
+    stop_loss_ticks: int = None,
+    take_profit_ticks: int = None,
+    daily_loss_limit: float = None,
+) -> int:
+    """Get existing session for today or create a new one.
+
+    This handles graceful restarts - if the service restarts mid-day,
+    it will resume the existing session instead of failing.
+    """
+    existing = get_session_by_date(date)
+    if existing:
+        return existing["id"]
+
+    return create_session(
+        date=date,
+        mode=mode,
+        symbol=symbol,
+        contract=contract,
+        tier_index=tier_index,
+        tier_name=tier_name,
+        starting_balance=starting_balance,
+        max_position_size=max_position_size,
+        stop_loss_ticks=stop_loss_ticks,
+        take_profit_ticks=take_profit_ticks,
+        daily_loss_limit=daily_loss_limit,
+    )
+
+
 def get_trades_for_session(session_id: int) -> List[Dict]:
     """Get all trades for a session."""
     conn = get_connection()
