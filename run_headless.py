@@ -569,7 +569,7 @@ class HeadlessTradingSystem:
             end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S-05:00")
 
             adapter = DatabentoAdapter(api_key=api_key)
-            contract = adapter._get_front_month_contract(self.symbol)
+            contract = DatabentoAdapter.get_front_month_contract(self.symbol)
 
             logger.info(f"Fetching {contract} from Databento ({start_time.strftime('%H:%M')} to {end_time.strftime('%H:%M')} ET)")
 
