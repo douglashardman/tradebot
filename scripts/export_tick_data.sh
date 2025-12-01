@@ -31,6 +31,24 @@ TICK_DATA_DIR="${TRADEBOT_DIR}/data/ticks"
 VENV_PYTHON="${TRADEBOT_DIR}/venv/bin/python"
 LOG_FILE="/var/log/tick_export.log"
 
+# Discord webhook (loaded from .env)
+source "${TRADEBOT_DIR}/.env"
+WEBHOOK_URL="${DISCORD_WEBHOOK_URL}"
+
+# Function to send Discord notification
+send_discord() {
+    local title="$1"
+    local message="$2"
+    local color="${3:-3447003}"  # Default blue
+
+    if [[ -n "${WEBHOOK_URL}" ]]; then
+        curl -s -H "Content-Type: application/json" \
+            -X POST "${WEBHOOK_URL}" \
+            -d "{\"embeds\":[{\"title\":\"${title}\",\"description\":\"${message}\",\"color\":${color}}]}" \
+            > /dev/null 2>&1
+    fi
+}
+
 # Get today's date
 TODAY=$(date +%Y-%m-%d)
 
@@ -58,6 +76,7 @@ if [[ ! -f "${PARQUET_FILE}" ]]; then
     echo "No tick data file for ${TODAY}"
     echo "Looking for any recent files..."
     ls -la "${TICK_DATA_DIR}/"*.parquet 2>/dev/null || echo "No parquet files found"
+    send_discord "Tick Export - No Data" "No tick data file found for ${TODAY}" "15158332"  # Yellow
     exit 0
 fi
 
@@ -83,8 +102,12 @@ if scp ${SCP_OPTS} "${PARQUET_FILE}" "${DEST}"; then
     if ssh ${SCP_OPTS} "${TICK_EXPORT_USER}@${TICK_EXPORT_HOST}" "ls -la ${TICK_EXPORT_PATH}/${TODAY}.parquet" 2>/dev/null; then
         echo "Verified file exists on remote server"
     fi
+
+    # Send success notification
+    send_discord "Tick Data Exported" "**${TODAY}.parquet** (${FILE_SIZE}) uploaded to home server" "3066993"  # Green
 else
     echo "ERROR: SCP failed"
+    send_discord "Tick Export FAILED" "Failed to upload ${TODAY}.parquet to home server" "15158332"  # Red
     exit 1
 fi
 
