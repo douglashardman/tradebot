@@ -123,21 +123,28 @@ TRADING_MODE=paper
 STARTING_BALANCE=2500
 DAILY_LOSS_LIMIT=-300
 
-# Warmup (loads historical data on startup)
-WARMUP_HOURS=3.0  # Hours of history to load (0 to disable)
+# Warmup (loads bar history on startup)
+WARMUP_MIN_BARS=30  # Minimum bars needed for regime detection (0 to disable)
 ```
 
-### Historical Warmup
-On startup, the system loads recent historical tick data and processes it to build bar history. This ensures the regime detector has enough data (21+ bars) to make accurate classifications immediately.
+### Historical Warmup & Bar Persistence
+The system persists completed bars to SQLite (`data/bars.db`) for instant warmup on restart. This ensures the regime detector has enough data (21+ bars) to make accurate classifications immediately, even after reboots or crashes.
 
-**Data sources (in order of preference):**
-1. **Local Parquet cache** (FREE) - uses `data/ticks/*.parquet` files we've already collected
-2. **Databento historical API** (PAID ~$2/day) - fallback if no local data
+**On each bar completion:**
+- Bar saved to SQLite (~200 bytes, one INSERT every 5 minutes)
+- Current regime state saved for quick restore
+- Negligible I/O impact
 
-- Default: 3 hours of history (~36 bars at 5-min timeframe)
-- Set `WARMUP_HOURS=0` to disable (start cold)
-- Warmup happens before live feed connects
-- Discord notification shows starting regime, confidence, and data source
+**On startup, data sources (in order of preference):**
+1. **Persisted bars** (INSTANT, FREE) - `data/bars.db` SQLite database
+2. **Local Parquet cache** (fast, FREE) - `data/ticks/*.parquet` files
+3. **Databento historical API** (slow, PAID ~$2/day) - last resort fallback
+
+**Edge cases handled:**
+- Mid-day reboot: Loads persisted bars instantly
+- First boot of day: Falls back to Parquet or Databento
+- Insufficient bars: Restores last known regime state as starting point
+- Old data: Auto-cleanup removes bars older than 7 days
 
 ### Trading Parameters
 - Stop Loss: 16 ticks (4 points)

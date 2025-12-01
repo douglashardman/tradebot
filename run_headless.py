@@ -72,6 +72,13 @@ from src.data.live_db import (
     log_account_snapshot as db_log_snapshot,
 )
 from src.data.tick_logger import TickLogger, get_tick_logger
+from src.data.bar_db import (
+    save_bar as db_save_bar,
+    get_recent_bars as db_get_recent_bars,
+    save_regime as db_save_regime,
+    get_last_regime as db_get_last_regime,
+    cleanup_old_bars as db_cleanup_old_bars,
+)
 
 # Heartbeat file for watchdog monitoring
 HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "heartbeat.json")
@@ -397,92 +404,117 @@ class HeadlessTradingSystem:
             )
             return False
 
-    async def warmup_historical(self, hours: float = 3.0) -> bool:
+    async def warmup_historical(self, min_bars: int = 30) -> bool:
         """
-        Warm up the engine and router with recent historical data.
+        Warm up the router with recent bar history.
 
-        First tries to load from local Parquet cache (free), then falls back
-        to Databento historical API (costs ~$2/day) if no local data.
+        Data sources (in order of preference):
+        1. Persisted bars from SQLite (instant, FREE)
+        2. Local Parquet tick cache (fast, FREE)
+        3. Databento historical API (slow, PAID ~$2/day)
 
         Args:
-            hours: Number of hours of historical data to load (default 3.0)
+            min_bars: Minimum number of bars needed for regime detection (default 30)
 
         Returns:
             True if warmup successful, False otherwise
         """
-        from src.data.aggregator import FootprintAggregator
+        logger.info(f"Starting warmup (need {min_bars}+ bars for regime detection)...")
 
-        logger.info(f"Starting historical warmup ({hours}h of data)...")
+        # Clean up old bars (keep 7 days)
+        try:
+            deleted = db_cleanup_old_bars(days=7)
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} old bars from database")
+        except Exception as e:
+            logger.warning(f"Bar cleanup failed: {e}")
 
-        now_et = datetime.now(ET)
-        start_time = now_et - timedelta(hours=hours)
+        # OPTION 1: Load persisted bars from SQLite (INSTANT, FREE)
+        bars = db_get_recent_bars(self.symbol, limit=min_bars + 20)
+        source = "persisted bars"
 
-        # Try local Parquet cache first (FREE)
-        ticks = self._load_local_ticks(start_time, now_et)
-        source = "local cache"
+        if len(bars) >= min_bars:
+            logger.info(f"Found {len(bars)} persisted bars - using for warmup")
+        else:
+            # OPTION 2: Load from local Parquet cache (FREE)
+            logger.info(f"Only {len(bars)} persisted bars, trying Parquet cache...")
+            now_et = datetime.now(ET)
+            start_time = now_et - timedelta(hours=3)
+            ticks = self._load_local_ticks(start_time, now_et)
 
-        # Fall back to Databento if no local data (PAID)
-        if not ticks:
+            if ticks:
+                bars = self._ticks_to_bars(ticks)
+                source = "Parquet cache"
+                logger.info(f"Built {len(bars)} bars from {len(ticks):,} cached ticks")
+
+        if len(bars) < min_bars:
+            # OPTION 3: Databento historical API (PAID)
             api_key = os.getenv("DATABENTO_API_KEY")
             if api_key:
+                logger.info(f"Only {len(bars)} bars, fetching from Databento...")
+                now_et = datetime.now(ET)
+                start_time = now_et - timedelta(hours=3)
                 ticks = self._fetch_databento_ticks(api_key, start_time, now_et)
-                source = "Databento"
-            else:
-                logger.warning("No local cache and no DATABENTO_API_KEY - starting cold")
-                return True
+                if ticks:
+                    bars = self._ticks_to_bars(ticks)
+                    source = "Databento API"
+                    logger.info(f"Built {len(bars)} bars from Databento")
 
-        if not ticks:
-            logger.warning("No historical ticks available - starting cold")
-            return True
+        # Feed bars to router
+        warmup_bars = 0
+        for bar in bars:
+            if self.router:
+                self.router.on_bar(bar)
+                warmup_bars += 1
 
-        logger.info(f"Processing {len(ticks):,} ticks from {source} for warmup...")
+        # If we still don't have enough bars, try to restore last known regime
+        if warmup_bars < min_bars:
+            last_regime, last_confidence = db_get_last_regime(self.symbol)
+            if last_regime and self.router:
+                from src.core.types import Regime
+                try:
+                    self.router.current_regime = Regime(last_regime)
+                    self.router.regime_confidence = last_confidence
+                    logger.info(f"Restored last regime: {last_regime} ({last_confidence:.0%})")
+                    source = f"restored ({source})"
+                except ValueError:
+                    pass
 
-        try:
-            # Use a separate aggregator for warmup to avoid triggering signal callbacks
-            warmup_aggregator = FootprintAggregator(self.timeframe)
-            warmup_bars = 0
+        # Log results
+        regime = self.router.current_regime.value if self.router else "N/A"
+        confidence = self.router.regime_confidence if self.router else 0
 
-            for tick in ticks:
-                # Only process if symbol matches
-                if tick.symbol == self.symbol or tick.symbol.startswith(self.symbol):
-                    completed_bar = warmup_aggregator.process_tick(tick)
-                    if completed_bar:
-                        # Feed bar to router for regime detection only (no signal processing)
-                        if self.router:
-                            self.router.on_bar(completed_bar)
-                        warmup_bars += 1
+        logger.info(
+            f"Warmup complete: {warmup_bars} bars from {source} | "
+            f"Regime: {regime} ({confidence:.0%} confidence)"
+        )
 
-            # Log warmup results
-            regime = self.router.current_regime.value if self.router else "N/A"
-            confidence = self.router.regime_confidence if self.router else 0
+        # Send Discord notification
+        await self.notifications.send_alert(
+            title="System Warmed Up",
+            message=(
+                f"Loaded {warmup_bars} bars from {source}\n"
+                f"Starting regime: **{regime}** ({confidence:.0%})"
+            ),
+            alert_type=AlertType.INFO,
+        )
 
-            logger.info(
-                f"Warmup complete: {len(ticks):,} ticks -> {warmup_bars} bars | "
-                f"Regime: {regime} ({confidence:.0%} confidence)"
-            )
+        return True
 
-            # Send Discord notification
-            await self.notifications.send_alert(
-                title="System Warmed Up",
-                message=(
-                    f"Loaded {hours}h from {source}: {len(ticks):,} ticks, {warmup_bars} bars\n"
-                    f"Starting regime: **{regime}** ({confidence:.0%})"
-                ),
-                alert_type=AlertType.INFO,
-            )
+    def _ticks_to_bars(self, ticks: List) -> List:
+        """Convert ticks to bars using a temporary aggregator."""
+        from src.data.aggregator import FootprintAggregator
 
-            return True
+        aggregator = FootprintAggregator(self.timeframe)
+        bars = []
 
-        except Exception as e:
-            logger.error(f"Warmup failed: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            await self.notifications.send_alert(
-                title="Warmup Failed",
-                message=f"Starting cold (no bar history): {e}",
-                alert_type=AlertType.WARNING,
-            )
-            return True  # Continue anyway
+        for tick in ticks:
+            if tick.symbol == self.symbol or tick.symbol.startswith(self.symbol):
+                completed_bar = aggregator.process_tick(tick)
+                if completed_bar:
+                    bars.append(completed_bar)
+
+        return bars
 
     def _load_local_ticks(self, start_time: datetime, end_time: datetime) -> List:
         """
@@ -886,8 +918,24 @@ class HeadlessTradingSystem:
             f"Levels:{len(bar.levels)}"
         )
 
+        # Persist bar to SQLite for warmup on restart
+        try:
+            db_save_bar(bar)
+        except Exception as e:
+            logger.warning(f"Failed to persist bar: {e}")
+
         if self.router:
             self.router.on_bar(bar)
+
+            # Persist regime state after each bar (for quick restore on restart)
+            try:
+                db_save_regime(
+                    self.symbol,
+                    self.router.current_regime.value,
+                    self.router.regime_confidence
+                )
+            except Exception as e:
+                logger.warning(f"Failed to persist regime: {e}")
 
         if bar.close_price and self.manager:
             self.manager.update_prices(bar.close_price)
@@ -1638,10 +1686,11 @@ async def main():
         logger.error("Setup failed")
         sys.exit(1)
 
-    # Warm up with historical data (builds bar history for regime detection)
-    warmup_hours = float(os.getenv("WARMUP_HOURS", "3.0"))
-    if warmup_hours > 0:
-        await system.warmup_historical(hours=warmup_hours)
+    # Warm up with historical bars (for regime detection)
+    # Uses: 1) persisted bars (instant), 2) Parquet cache, 3) Databento API
+    min_warmup_bars = int(os.getenv("WARMUP_MIN_BARS", "30"))
+    if min_warmup_bars > 0:
+        await system.warmup_historical(min_bars=min_warmup_bars)
 
     # Connect to data feed
     if not await system.connect_data_feed():
