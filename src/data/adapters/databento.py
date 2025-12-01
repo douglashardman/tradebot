@@ -53,6 +53,10 @@ class DatabentoAdapter:
         self._on_connected_callbacks: List[Callable[[], None]] = []
         self._on_disconnected_callbacks: List[Callable[[], None]] = []
 
+        # Front-month contracts (computed at startup, refreshed daily)
+        self._front_month_contracts: dict = {}
+        self._front_month_date: Optional[str] = None
+
         # Symbol mapping: our symbol -> Databento symbol
         self.symbol_map = {
             "ES": "ES.FUT",
@@ -94,6 +98,26 @@ class DatabentoAdapter:
     def reconnect_count(self) -> int:
         """Get number of reconnections this session."""
         return self._reconnect_count
+
+    def _refresh_front_month_contracts(self) -> None:
+        """Refresh the front-month contract mapping for today's date."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._front_month_date == today:
+            return  # Already computed for today
+
+        # Compute front-month for each base symbol
+        for base in ["ES", "MES", "NQ", "MNQ", "CL", "GC"]:
+            contract = self.get_front_month_contract(base)
+            self._front_month_contracts[base] = contract
+            logger.info(f"Front-month contract for {base}: {contract}")
+
+        self._front_month_date = today
+
+    def _is_front_month(self, raw_symbol: str, base_symbol: str) -> bool:
+        """Check if raw_symbol is the front-month contract for base_symbol."""
+        self._refresh_front_month_contracts()
+        expected = self._front_month_contracts.get(base_symbol)
+        return raw_symbol == expected
 
     def _emit_tick(self, tick: Tick) -> None:
         """Emit tick to all registered callbacks."""
@@ -302,6 +326,11 @@ class DatabentoAdapter:
                     else:
                         # Fallback: try first symbol in subscription
                         our_symbol = self._current_symbols[0] if self._current_symbols else "ES"
+
+                    # IMPORTANT: Only process front-month contracts
+                    # Skip deferred months (e.g., MESH6, MESM6 when front is MESZ5)
+                    if not self._is_front_month(raw_symbol, our_symbol):
+                        continue
 
                     tick = self._convert_trade(record, our_symbol)
                     self._emit_tick(tick)

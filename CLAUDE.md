@@ -170,10 +170,9 @@ TRADING_MODE=paper                 # paper or live
 DAILY_PROFIT_TARGET=500
 DAILY_LOSS_LIMIT=-300
 
-# Margin limits - won't trade if margins exceed these (high volatility days)
-MES_MARGIN_LIMIT=40                # Normal MES day trading margin is $40
-ES_MARGIN_LIMIT=400                # Normal ES is $300, using $400 as buffer
-MARGIN_CHECK_FAIL_SAFE=false       # If true, don't trade when margin query fails
+# Margin limits - pauses trades if margins exceed these (high volatility periods)
+MES_MARGIN_LIMIT=50                # Pause if MES margin > $50 (normal ~$40)
+ES_MARGIN_LIMIT=500                # Pause if ES margin > $500 (normal ~$300)
 ```
 
 ### Default Trading Parameters

@@ -71,6 +71,7 @@ from src.data.live_db import (
     log_connection_event as db_log_connection,
     log_account_snapshot as db_log_snapshot,
 )
+from src.data.tick_logger import TickLogger, get_tick_logger
 
 # Heartbeat file for watchdog monitoring
 HEARTBEAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "heartbeat.json")
@@ -155,6 +156,9 @@ class HeadlessTradingSystem:
         self._margin_is_high: bool = False
         self._last_margin_check: Optional[datetime] = None
         self._margin_check_interval: int = 60  # Check at most every 60 seconds
+
+        # Tick logging for Parquet storage
+        self.tick_logger: Optional[TickLogger] = None
 
     async def setup(self) -> bool:
         """Initialize all components."""
@@ -273,6 +277,10 @@ class HeadlessTradingSystem:
             flatten_before_close_minutes=flatten_minutes,
             market_close=market_close,
         )
+
+        # Initialize tick logger for Parquet storage
+        self.tick_logger = get_tick_logger()
+        logger.info("Tick logger initialized")
 
         logger.info("All components initialized")
         return True
@@ -671,6 +679,13 @@ class HeadlessTradingSystem:
         if self.notifications:
             await self.notifications.close()
 
+        # Flush tick data to Parquet before shutdown
+        if self.tick_logger:
+            logger.info("Flushing tick data to Parquet...")
+            paths = self.tick_logger.flush_all()
+            if paths:
+                logger.info(f"Saved tick data to: {', '.join(paths)}")
+
         # Clear persistence (clean shutdown)
         if self.persistence:
             self.persistence.clear_state()
@@ -681,8 +696,17 @@ class HeadlessTradingSystem:
 
     def _process_tick(self, tick) -> None:
         """Process incoming tick."""
+        # Filter to only process ticks for our configured symbol
+        # (Databento streams both ES and MES, we only want one)
+        if hasattr(tick, 'symbol') and tick.symbol != self.symbol:
+            return
+
         self._tick_count += 1
         self._last_tick_time = datetime.now()
+
+        # Log tick to Parquet storage
+        if self.tick_logger:
+            self.tick_logger.log_tick(tick)
 
         if self.engine:
             self.engine.process_tick(tick)
