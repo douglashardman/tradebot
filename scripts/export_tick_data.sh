@@ -23,7 +23,7 @@ set -e
 TICK_EXPORT_HOST="${TICK_EXPORT_HOST:-99.69.168.225}"
 TICK_EXPORT_USER="${TICK_EXPORT_USER:-faded-vibes}"
 TICK_EXPORT_PATH="${TICK_EXPORT_PATH:-/home/faded-vibes/tradebot/data/tick_cache}"
-TICK_EXPORT_KEY="${TICK_EXPORT_KEY:-/root/.ssh/tradebot_sync}"
+TICK_EXPORT_KEY="${TICK_EXPORT_KEY:-/home/tradebot/.ssh/tradebot_sync}"
 
 # Local paths
 TRADEBOT_DIR="/opt/tradebot"
