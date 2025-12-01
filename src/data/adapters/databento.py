@@ -1,11 +1,14 @@
 """Databento data feed adapter for live and historical data."""
 
+import asyncio
+import logging
 import os
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
-import threading
+from typing import Callable, List, Optional, Union
 
 from src.core.types import Tick
+
+logger = logging.getLogger(__name__)
 
 
 class DatabentoAdapter:
@@ -37,7 +40,18 @@ class DatabentoAdapter:
 
         self.callbacks: List[Callable[[Tick], None]] = []
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._live_client = None
+        self._stream_task: Optional[asyncio.Task] = None
+
+        # Connection state
+        self._connected = False
+        self._last_tick_time: Optional[datetime] = None
+        self._tick_count = 0
+        self._reconnect_count = 0
+
+        # Connection callbacks
+        self._on_connected_callbacks: List[Callable[[], None]] = []
+        self._on_disconnected_callbacks: List[Callable[[], None]] = []
 
         # Symbol mapping: our symbol -> Databento symbol
         self.symbol_map = {
@@ -53,10 +67,67 @@ class DatabentoAdapter:
         """Register a callback to receive ticks."""
         self.callbacks.append(callback)
 
+    def on_connected(self, callback: Callable[[], None]) -> None:
+        """Register callback for connection established."""
+        self._on_connected_callbacks.append(callback)
+
+    def on_disconnected(self, callback: Callable[[], None]) -> None:
+        """Register callback for disconnection."""
+        self._on_disconnected_callbacks.append(callback)
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if currently connected to feed."""
+        return self._connected
+
+    @property
+    def last_tick_time(self) -> Optional[datetime]:
+        """Get timestamp of last received tick."""
+        return self._last_tick_time
+
+    @property
+    def tick_count(self) -> int:
+        """Get total ticks received this session."""
+        return self._tick_count
+
+    @property
+    def reconnect_count(self) -> int:
+        """Get number of reconnections this session."""
+        return self._reconnect_count
+
     def _emit_tick(self, tick: Tick) -> None:
         """Emit tick to all registered callbacks."""
+        self._last_tick_time = tick.timestamp
+        self._tick_count += 1
         for callback in self.callbacks:
-            callback(tick)
+            try:
+                callback(tick)
+            except Exception as e:
+                logger.error(f"Error in tick callback: {e}")
+
+    def _emit_connected(self) -> None:
+        """Notify connection established."""
+        self._connected = True
+        for callback in self._on_connected_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback())
+                else:
+                    callback()
+            except Exception as e:
+                logger.error(f"Error in connected callback: {e}")
+
+    def _emit_disconnected(self) -> None:
+        """Notify disconnection."""
+        self._connected = False
+        for callback in self._on_disconnected_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback())
+                else:
+                    callback()
+            except Exception as e:
+                logger.error(f"Error in disconnected callback: {e}")
 
     def _convert_trade(self, record, symbol: str) -> Tick:
         """
@@ -95,12 +166,19 @@ class DatabentoAdapter:
             symbol=symbol
         )
 
-    def start_live(self, symbol: str, dataset: str = "GLBX.MDP3") -> None:
+    async def start_live_async(
+        self,
+        symbol: Union[str, List[str]],
+        dataset: str = "GLBX.MDP3"
+    ) -> None:
         """
-        Start live data streaming.
+        Start live data streaming with async support.
+
+        This method starts the live feed and processes ticks in the background.
+        Use stop_live() to stop streaming.
 
         Args:
-            symbol: Our symbol (e.g., "ES", "MES")
+            symbol: Our symbol(s) - single string or list (e.g., "ES" or ["ES", "MES"])
             dataset: Databento dataset ID (default CME Globex)
         """
         try:
@@ -108,37 +186,181 @@ class DatabentoAdapter:
         except ImportError:
             raise ImportError("databento package required. Install with: pip install databento")
 
-        db_symbol = self.symbol_map.get(symbol, f"{symbol}.FUT")
+        # Handle single symbol or list
+        if isinstance(symbol, str):
+            symbols = [symbol]
+        else:
+            symbols = symbol
 
-        def _stream():
-            client = db.Live(key=self.api_key)
-            client.subscribe(
-                dataset=dataset,
-                schema="trades",
-                stype_in="parent",
-                symbols=db_symbol,
-            )
+        # Map to Databento symbols
+        db_symbols = [self.symbol_map.get(s, f"{s}.FUT") for s in symbols]
+        self._current_symbols = symbols
 
-            self._running = True
-            for record in client:
+        logger.info(f"Connecting to Databento live feed for {db_symbols}...")
+
+        # Create client with auto-reconnect
+        self._live_client = db.Live(
+            key=self.api_key,
+            reconnect_policy="reconnect",
+        )
+
+        # Set up reconnection callback
+        def _on_reconnect(client):
+            self._reconnect_count += 1
+            logger.warning(f"Databento reconnected (count: {self._reconnect_count})")
+            self._emit_connected()
+
+        self._live_client.add_reconnect_callback(_on_reconnect)
+
+        # Subscribe to trades for all symbols
+        self._live_client.subscribe(
+            dataset=dataset,
+            schema="trades",
+            stype_in="parent",
+            symbols=db_symbols,
+        )
+
+        self._running = True
+        self._emit_connected()
+        logger.info(f"Databento live feed connected for {db_symbols}")
+
+        # Start the streaming task
+        self._stream_task = asyncio.create_task(
+            self._stream_loop_multi()
+        )
+
+    async def _stream_loop(self, symbol: str) -> None:
+        """Internal async loop to process incoming records (single symbol)."""
+        try:
+            import databento as db
+        except ImportError:
+            return
+
+        try:
+            async for record in self._live_client:
                 if not self._running:
                     break
+
+                # Only process trade messages
+                if not isinstance(record, db.TradeMsg):
+                    continue
 
                 try:
                     tick = self._convert_trade(record, symbol)
                     self._emit_tick(tick)
                 except Exception as e:
-                    print(f"Error processing trade: {e}")
+                    logger.error(f"Error processing trade: {e}")
 
-        self._thread = threading.Thread(target=_stream, daemon=True)
-        self._thread.start()
+        except asyncio.CancelledError:
+            logger.info("Databento stream task cancelled")
+        except Exception as e:
+            logger.error(f"Databento stream error: {e}")
+            self._emit_disconnected()
+
+    async def _stream_loop_multi(self) -> None:
+        """Internal async loop to process incoming records (multi-symbol)."""
+        try:
+            import databento as db
+        except ImportError:
+            return
+
+        # Reverse map: Databento symbol -> our symbol
+        reverse_map = {v: k for k, v in self.symbol_map.items()}
+
+        try:
+            async for record in self._live_client:
+                if not self._running:
+                    break
+
+                # Only process trade messages
+                if not isinstance(record, db.TradeMsg):
+                    continue
+
+                try:
+                    # Get the raw symbol from symbology map
+                    raw_symbol = self._live_client.symbology_map.get(record.instrument_id, "")
+
+                    # Skip spread/calendar symbols (they contain a hyphen, e.g., "ESZ5-ESH6")
+                    # Spread prices are tiny differences (like 58.25) not outright prices
+                    if "-" in raw_symbol:
+                        continue
+
+                    # Determine our symbol (ES, MES, etc.) from the raw symbol
+                    # Raw symbols look like "ESZ5", "MESZ5", etc.
+                    if raw_symbol.startswith("MES"):
+                        our_symbol = "MES"
+                    elif raw_symbol.startswith("MNQ"):
+                        our_symbol = "MNQ"
+                    elif raw_symbol.startswith("ES"):
+                        our_symbol = "ES"
+                    elif raw_symbol.startswith("NQ"):
+                        our_symbol = "NQ"
+                    elif raw_symbol.startswith("CL"):
+                        our_symbol = "CL"
+                    elif raw_symbol.startswith("GC"):
+                        our_symbol = "GC"
+                    else:
+                        # Fallback: try first symbol in subscription
+                        our_symbol = self._current_symbols[0] if self._current_symbols else "ES"
+
+                    tick = self._convert_trade(record, our_symbol)
+                    self._emit_tick(tick)
+                except Exception as e:
+                    logger.error(f"Error processing trade: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Databento stream task cancelled")
+        except Exception as e:
+            logger.error(f"Databento stream error: {e}")
+            self._emit_disconnected()
+
+    def start_live(self, symbol: str, dataset: str = "GLBX.MDP3") -> None:
+        """
+        Start live data streaming (sync wrapper for backward compatibility).
+
+        For async applications, use start_live_async() instead.
+
+        Args:
+            symbol: Our symbol (e.g., "ES", "MES")
+            dataset: Databento dataset ID (default CME Globex)
+        """
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Schedule as a task if loop is already running
+            asyncio.create_task(self.start_live_async(symbol, dataset))
+        else:
+            # Run directly if no loop is running
+            loop.run_until_complete(self.start_live_async(symbol, dataset))
+
+    async def stop_live_async(self) -> None:
+        """Stop live data streaming (async version)."""
+        self._running = False
+
+        if self._stream_task:
+            self._stream_task.cancel()
+            try:
+                await self._stream_task
+            except asyncio.CancelledError:
+                pass
+            self._stream_task = None
+
+        if self._live_client:
+            try:
+                self._live_client.stop()
+            except Exception as e:
+                logger.error(f"Error stopping Databento client: {e}")
+            self._live_client = None
+
+        self._emit_disconnected()
+        logger.info("Databento live feed stopped")
 
     def stop_live(self) -> None:
-        """Stop live data streaming."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
+        """Stop live data streaming (sync wrapper)."""
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(self.stop_live_async())
+        else:
+            loop.run_until_complete(self.stop_live_async())
 
     def get_historical(
         self,

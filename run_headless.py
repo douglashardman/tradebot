@@ -390,7 +390,7 @@ class HeadlessTradingSystem:
             return False
 
     async def _connect_databento(self) -> bool:
-        """Connect to Databento (for paper trading)."""
+        """Connect to Databento live data feed."""
         try:
             from src.data.adapters.databento import DatabentoAdapter
 
@@ -404,14 +404,24 @@ class HeadlessTradingSystem:
                 return False
 
             self.data_adapter = DatabentoAdapter(api_key=api_key)
+
+            # Register connection callbacks
+            self.data_adapter.on_connected(self._on_feed_connected)
+            self.data_adapter.on_disconnected(self._on_feed_disconnected)
             self.data_adapter.register_callback(self._process_tick)
 
-            logger.info(f"Starting Databento live feed for {self.symbol}")
-            self.data_adapter.start_live(self.symbol)
+            # Subscribe to both ES and MES for multi-tenant support
+            # Ticks will include the symbol so the system can filter as needed
+            symbols = ["ES", "MES"]
+            logger.info(f"Starting Databento live feed for {symbols}")
+
+            # Use async version for proper integration
+            await self.data_adapter.start_live_async(symbols)
 
             # Mark feed as connected for heartbeat
             self._feed_connected = True
 
+            logger.info(f"Databento live feed active for {self.symbol}")
             return True
 
         except Exception as e:
@@ -652,6 +662,8 @@ class HeadlessTradingSystem:
         if self.data_adapter:
             if hasattr(self.data_adapter, 'disconnect'):
                 await self.data_adapter.disconnect()
+            elif hasattr(self.data_adapter, 'stop_live_async'):
+                await self.data_adapter.stop_live_async()
             elif hasattr(self.data_adapter, 'stop_live'):
                 self.data_adapter.stop_live()
 
@@ -687,6 +699,14 @@ class HeadlessTradingSystem:
         # Reset stacked signals for new bar
         self._current_bar_signals = []
 
+        # Log bar completion for visibility
+        logger.info(
+            f"Bar complete: {bar.start_time.strftime('%H:%M')} | "
+            f"O:{bar.open_price:.2f} H:{bar.high_price:.2f} L:{bar.low_price:.2f} C:{bar.close_price:.2f} | "
+            f"Vol:{bar.total_volume:,} Delta:{bar.delta:+,} | "
+            f"Levels:{len(bar.levels)}"
+        )
+
         if self.router:
             self.router.on_bar(bar)
 
@@ -695,6 +715,12 @@ class HeadlessTradingSystem:
 
     def _on_signal(self, signal: Signal) -> None:
         """Handle signal from engine."""
+        # Log all signals detected (before routing/filtering)
+        logger.info(
+            f"Signal detected: {signal.pattern} | {signal.direction} @ {signal.price:.2f} | "
+            f"Strength:{getattr(signal, 'strength', 'N/A')}"
+        )
+
         if not self.router or not self.manager:
             return
 
@@ -703,6 +729,12 @@ class HeadlessTradingSystem:
 
         # Evaluate through router
         signal = self.router.evaluate_signal(signal)
+
+        # Log routing decision
+        if signal.approved:
+            logger.info(f"Signal APPROVED: {signal.pattern} -> ready to execute")
+        else:
+            logger.debug(f"Signal REJECTED: {signal.pattern} - {signal.rejection_reason}")
 
         if signal.approved and not self.dry_run:
             # Check margin requirements before trading (async check)
@@ -1347,10 +1379,16 @@ class HeadlessTradingSystem:
                 tier_name = self.tier_manager.state.tier_name
                 balance = self.tier_manager.state.balance
 
+            # Get engine stats if available
+            bar_count = self.engine.bar_count if self.engine else 0
+            signal_count = self.engine.signal_count if self.engine else 0
+
             heartbeat_data = {
                 "timestamp": now.isoformat(),
                 "last_tick_time": self._last_tick_time.isoformat() if self._last_tick_time else None,
                 "tick_count": self._tick_count,
+                "bar_count": bar_count,
+                "signal_count": signal_count,
                 "feed_connected": self._feed_connected,
                 "reconnect_count": self._reconnect_count,
                 "daily_pnl": daily_pnl,
