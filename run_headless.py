@@ -162,6 +162,10 @@ class HeadlessTradingSystem:
         # Margin tracking - alert once when high, once when normal
         self._margin_is_high: bool = False
         self._last_margin_check: Optional[datetime] = None
+
+        # RTH trading window (9:30 AM - 4:00 PM ET)
+        self._is_rth: bool = False
+        self._daily_digest_sent: bool = False
         self._margin_check_interval: int = 60  # Check at most every 60 seconds
 
         # Tick logging for Parquet storage
@@ -744,28 +748,40 @@ class HeadlessTradingSystem:
         self._running = True
         logger.info("Trading session active")
 
+        # Track whether we've sent daily digest
+        self._daily_digest_sent = False
+
         try:
             while self._running:
-                # Check if we should still be trading
                 now_et = datetime.now(ET)
-                market_close = get_market_close_time(now_et)
-                close_dt = now_et.replace(
-                    hour=market_close.hour,
-                    minute=market_close.minute,
-                    second=0,
-                )
 
-                if now_et >= close_dt:
-                    logger.info("Market closed, ending session")
-                    break
-
-                # Check for halt conditions
+                # Check for halt conditions (loss limit, etc.)
                 if self.manager.is_halted:
                     logger.info(f"Session halted: {self.manager.halt_reason}")
                     await self._on_session_halted()
-                    break
+                    # Don't break - keep collecting data, just stop trading
 
-                # Write heartbeat even if no ticks (for watchdog monitoring)
+                # Check if we're in RTH (9:30 AM - 4:00 PM ET)
+                market_open = time(9, 30)
+                market_close = get_market_close_time(now_et)
+                current_time = now_et.time()
+
+                is_rth = market_open <= current_time < market_close
+
+                # Update trading state (signals only processed during RTH)
+                self._is_rth = is_rth
+
+                # Send daily digest once at market close
+                if not is_rth and current_time >= market_close and not self._daily_digest_sent:
+                    logger.info("Market closed - sending daily digest")
+                    await self._send_daily_digest()
+                    self._daily_digest_sent = True
+
+                # Reset digest flag after midnight for next day
+                if current_time < market_open:
+                    self._daily_digest_sent = False
+
+                # Write heartbeat (for watchdog monitoring)
                 self._write_heartbeat()
 
                 await asyncio.sleep(1)
@@ -949,6 +965,11 @@ class HeadlessTradingSystem:
         )
 
         if not self.router or not self.manager:
+            return
+
+        # Only process trades during RTH (9:30 AM - 4:00 PM ET)
+        if not getattr(self, '_is_rth', False):
+            logger.debug(f"Signal outside RTH - skipping trade execution")
             return
 
         # Track signal for stacking detection
