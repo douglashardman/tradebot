@@ -1126,6 +1126,14 @@ class HeadlessTradingSystem:
 
         # Log trade entry to database
         if self._db_session_id:
+            # Convert enums to strings for database
+            pattern = ctx.get("pattern")
+            if hasattr(pattern, "value"):
+                pattern = pattern.value
+            regime = ctx.get("regime")
+            if hasattr(regime, "value"):
+                regime = regime.value
+
             trade_id = db_log_trade(
                 session_id=self._db_session_id,
                 trade_num=self._trade_count,
@@ -1138,9 +1146,9 @@ class HeadlessTradingSystem:
                 bracket_id=position.bracket_id,
                 stop_price=position.stop_price,
                 target_price=position.target_price,
-                pattern=ctx.get("pattern"),
+                pattern=pattern,
                 signal_strength=ctx.get("signal_strength"),
-                regime=ctx.get("regime"),
+                regime=regime,
                 regime_score=ctx.get("regime_score"),
                 tier_index=ctx.get("tier_index"),
                 tier_name=ctx.get("tier_name"),
@@ -1469,26 +1477,45 @@ class HeadlessTradingSystem:
         if not self.manager:
             return
 
-        stats = self.manager.get_statistics()
-        state = self.manager.get_state()
+        # Get session and trades from database (authoritative source across restarts)
+        db_session = None
+        db_trades = []
+        if self._db_session_id:
+            db_session = db_get_session_by_date(datetime.now().strftime("%Y-%m-%d"))
+            db_trades = db_get_trades_for_session(self._db_session_id)
+            # Filter to only completed trades (have exit_price)
+            db_trades = [t for t in db_trades if t.get("exit_price")]
 
-        # Build regime breakdown
+        # Build regime breakdown from database
         regime_breakdown = {}
-        for trade in self.manager.completed_trades:
-            regime = getattr(trade, 'regime', 'UNKNOWN')
+        for trade in db_trades:
+            regime = trade.get("regime", "UNKNOWN") or "UNKNOWN"
             regime_breakdown[regime] = regime_breakdown.get(regime, 0) + 1
 
-        # Build trades detail
+        # Build trades detail from database
         trades_detail = []
-        for trade in self.manager.completed_trades[-10:]:
+        for trade in db_trades[-10:]:
+            entry_time = trade.get("entry_time", "")
+            if entry_time and len(entry_time) >= 16:
+                # Parse ISO format and extract HH:MM
+                entry_time = entry_time[11:16]
             trades_detail.append({
-                "side": trade.side,
-                "entry_price": trade.entry_price,
-                "exit_price": trade.exit_price,
-                "exit_reason": trade.exit_reason,
-                "pnl": trade.pnl,
-                "entry_time": trade.entry_time.strftime("%H:%M") if trade.entry_time else "",
+                "side": trade.get("direction", "?"),
+                "entry_price": trade.get("entry_price", 0),
+                "exit_price": trade.get("exit_price", 0),
+                "exit_reason": trade.get("exit_reason", "?"),
+                "pnl": trade.get("pnl_net", 0) or 0,
+                "entry_time": entry_time,
             })
+
+        # Calculate stats from database
+        total_trades = len(db_trades)
+        wins = len([t for t in db_trades if (t.get("pnl_net") or 0) > 0])
+        losses = len([t for t in db_trades if (t.get("pnl_net") or 0) < 0])
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
+        # Calculate P&L from database trades (authoritative)
+        day_pnl = sum(t.get("pnl_net", 0) or 0 for t in db_trades)
 
         # Position status
         position_str = "FLAT"
@@ -1496,16 +1523,12 @@ class HeadlessTradingSystem:
             pos = self.manager.open_positions[0]
             position_str = f"{pos.side} {pos.size} @ {pos.entry_price}"
 
-        # Balance - use tier manager if available
-        if self.tier_manager:
-            ending_balance = self.tier_manager.state.balance
-            tier_info = self.tier_manager.get_status()
-        else:
-            ending_balance = getattr(
-                self.manager, 'paper_balance',
-                self._starting_balance + self.manager.daily_pnl
-            )
-            tier_info = None
+        # Get starting balance from DB session (authoritative for the day)
+        starting_balance = db_session.get("starting_balance", 2500.0) if db_session else 2500.0
+        ending_balance = starting_balance + day_pnl
+
+        # Get tier info for status
+        tier_info = self.tier_manager.get_status() if self.tier_manager else None
 
         # Status
         status = "COMPLETED"
@@ -1521,13 +1544,13 @@ class HeadlessTradingSystem:
             session_start="09:30",
             session_end=get_market_close_time().strftime("%H:%M"),
             status=status,
-            starting_balance=self._starting_balance,
+            starting_balance=starting_balance,
             ending_balance=ending_balance,
-            day_pnl=self.manager.daily_pnl,
-            trades=stats.get("total_trades", 0),
-            wins=state.get("win_count", 0),
-            losses=state.get("loss_count", 0),
-            win_rate=stats.get("win_rate", 0) * 100,
+            day_pnl=day_pnl,
+            trades=total_trades,
+            wins=wins,
+            losses=losses,
+            win_rate=win_rate,
             trades_detail=trades_detail,
             regime_breakdown=regime_breakdown,
             current_position=position_str,
@@ -1616,11 +1639,10 @@ class HeadlessTradingSystem:
         self.persistence.save_state(state)
 
     def _try_resume_session(self) -> bool:
-        """Try to resume session from database.
+        """Try to resume session from database and state file.
 
-        Pulls today's session data from the database (authoritative source)
-        to restore daily P&L, trade count, and halt state. This ensures
-        restarts don't "forget" earlier trades.
+        Uses database for P&L (sum of all completed trades) since it persists
+        across restarts. Uses state file for additional state like streaks.
 
         Returns:
             True if session was resumed, False if starting fresh.
@@ -1632,16 +1654,18 @@ class HeadlessTradingSystem:
         if not db_session:
             return False
 
-        # Get trades from database
+        # Get P&L from database trades (authoritative - persists across restarts)
         db_trades = db_get_trades_for_session(db_session["id"])
-
-        # Calculate P&L from completed trades
         daily_pnl = sum(t.get("pnl_net", 0) or 0 for t in db_trades if t.get("exit_price"))
         trade_count = len([t for t in db_trades if t.get("exit_price")])
 
-        # Check session status
+        # Get halt state from session
         is_halted = db_session.get("status") == "HALTED"
         halt_reason = db_session.get("halted_reason")
+
+        # Calculate paper balance
+        starting_balance = db_session.get("starting_balance", self._starting_balance)
+        paper_balance = starting_balance + daily_pnl
 
         # Apply to execution manager
         if self.manager:
@@ -1649,15 +1673,18 @@ class HeadlessTradingSystem:
             self.manager.is_halted = is_halted
             self.manager.halt_reason = halt_reason
 
-            # Calculate paper balance from starting balance + P&L
-            if self.session.mode == "paper":
-                starting = db_session.get("starting_balance", self._starting_balance)
-                self.manager.paper_balance = starting + daily_pnl
+            if paper_balance is not None and self.session.mode == "paper":
+                self.manager.paper_balance = paper_balance
 
-        # Update trade count for DB logging (so next trade gets correct number)
+        # Update trade count for DB logging
         self._trade_count = trade_count
 
-        # Also try to restore additional state from state file (streaks, etc.)
+        # Update tier manager with correct values from DB
+        if self.tier_manager:
+            self.tier_manager.state.balance = paper_balance
+            self.tier_manager.state.session_pnl = daily_pnl
+
+        # Try to restore streaks from state file (if available)
         if self.persistence:
             state = self.persistence.load_state()
             if state:
@@ -1667,10 +1694,6 @@ class HeadlessTradingSystem:
                         self.tier_manager.state.win_streak = tier_status["win_streak"]
                     if "loss_streak" in tier_status:
                         self.tier_manager.state.loss_streak = tier_status["loss_streak"]
-
-        # Update tier manager with session P&L
-        if self.tier_manager:
-            self.tier_manager.state.session_pnl = daily_pnl
 
         logger.info(
             f"Resumed session: P&L=${daily_pnl:+.2f}, {trade_count} trades, "
@@ -1724,7 +1747,8 @@ class HeadlessTradingSystem:
 
             # Gather status info
             daily_pnl = self.manager.daily_pnl if self.manager else 0
-            trade_count = len(self.manager.completed_trades) if self.manager else 0
+            # Use tracked trade count (persisted across restarts via _try_resume_session)
+            trade_count = self._trade_count
             open_positions = len(self.manager.open_positions) if self.manager else 0
             is_halted = self.manager.is_halted if self.manager else False
             halt_reason = self.manager.halt_reason if self.manager else None

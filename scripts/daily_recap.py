@@ -95,6 +95,95 @@ def get_errors_warnings(today_str: str) -> list:
     return issues[:50]  # Limit to 50 entries
 
 
+def get_restarts(today_str: str) -> dict:
+    """Extract system restart events from journalctl for today.
+
+    Returns dict with:
+    - events: list of all startup/shutdown/resume events with timestamps
+    - gaps: list of restart gaps showing downtime periods
+    """
+    events = []
+    try:
+        result = subprocess.run(
+            ["journalctl", "-u", "tradebot", "--since", f"{today_str} 00:00:00",
+             "--until", f"{today_str} 23:59:59", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        for line in result.stdout.split("\n"):
+            # Capture startup and shutdown events
+            if "HEADLESS TRADING SYSTEM STARTUP" in line:
+                # Extract timestamp from journalctl line (format: "Dec 02 15:07:31")
+                parts = line.split()
+                if len(parts) >= 3:
+                    time_str = parts[2]  # e.g., "15:07:31"
+                    events.append({"time": time_str, "event": "STARTUP"})
+            elif "Received shutdown signal" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    time_str = parts[2]
+                    events.append({"time": time_str, "event": "SHUTDOWN"})
+            elif "Resumed session:" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    time_str = parts[2]
+                    # Extract P&L and trade count from the line
+                    pnl_str = None
+                    trades_str = None
+                    if "P&L=" in line:
+                        idx = line.find("P&L=")
+                        pnl_str = line[idx:].split(",")[0].replace("P&L=", "")
+                    if "trades" in line:
+                        # Extract "X trades"
+                        import re
+                        match = re.search(r'(\d+)\s+trades', line)
+                        if match:
+                            trades_str = match.group(1)
+                    events.append({
+                        "time": time_str,
+                        "event": "RESUMED",
+                        "pnl": pnl_str,
+                        "trades": trades_str
+                    })
+    except Exception as e:
+        events.append({"error": str(e)})
+
+    # Calculate gaps between shutdown and next startup
+    gaps = []
+    last_shutdown = None
+    for event in events:
+        if event.get("event") == "SHUTDOWN":
+            last_shutdown = event.get("time")
+        elif event.get("event") == "STARTUP" and last_shutdown:
+            # Calculate gap duration
+            try:
+                from datetime import datetime
+                fmt = "%H:%M:%S"
+                t1 = datetime.strptime(last_shutdown, fmt)
+                t2 = datetime.strptime(event.get("time"), fmt)
+                gap_seconds = (t2 - t1).total_seconds()
+                gaps.append({
+                    "shutdown": last_shutdown,
+                    "startup": event.get("time"),
+                    "gap_seconds": int(gap_seconds)
+                })
+            except:
+                gaps.append({
+                    "shutdown": last_shutdown,
+                    "startup": event.get("time"),
+                    "gap_seconds": None
+                })
+            last_shutdown = None
+
+    return {
+        "events": events,
+        "gaps": gaps,
+        "total_restarts": len([e for e in events if e.get("event") == "STARTUP"]),
+        "total_downtime_seconds": sum(g.get("gap_seconds", 0) or 0 for g in gaps)
+    }
+
+
 def get_heartbeat() -> dict:
     """Read current heartbeat file."""
     try:
@@ -128,6 +217,7 @@ def generate_recap(target_date: date = None) -> dict:
     signals = get_signal_log(today_str)
     bars = get_bar_log(today_str)
     errors = get_errors_warnings(today_str)
+    restarts = get_restarts(today_str)
 
     # Build recap
     recap = {
@@ -163,8 +253,11 @@ def generate_recap(target_date: date = None) -> dict:
             "total_trades": len(trades),
             "total_orders": len(orders),
             "errors_warnings": len(errors),
+            "restarts": restarts.get("total_restarts", 0),
+            "total_downtime_seconds": restarts.get("total_downtime_seconds", 0),
         },
 
+        "restarts": restarts,
         "trades": trades,
         "orders": orders,
         "signals": signals,

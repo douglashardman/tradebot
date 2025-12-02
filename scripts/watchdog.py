@@ -410,15 +410,27 @@ class WatchdogMonitor:
         day_pnl = 0
         trades = 0
 
-        # Try to read from heartbeat (has today's stats)
-        if HEARTBEAT_FILE.exists():
-            try:
-                with open(HEARTBEAT_FILE) as f:
-                    data = json.load(f)
-                day_pnl = data.get("daily_pnl", 0)
-                trades = data.get("trade_count", 0)
-            except Exception:
-                pass
+        # Get authoritative trade data from database
+        try:
+            from src.data.live_db import get_session_by_date, get_trades_for_session
+            today = datetime.now(ET).strftime("%Y-%m-%d")
+            session = get_session_by_date(today)
+            if session:
+                db_trades = get_trades_for_session(session["id"])
+                completed = [t for t in db_trades if t.get("exit_price")]
+                trades = len(completed)
+                day_pnl = sum(t.get("pnl_net", 0) or 0 for t in completed)
+        except Exception as e:
+            logger.warning(f"Could not get trades from DB: {e}")
+            # Fallback to heartbeat
+            if HEARTBEAT_FILE.exists():
+                try:
+                    with open(HEARTBEAT_FILE) as f:
+                        data = json.load(f)
+                    day_pnl = data.get("daily_pnl", 0)
+                    trades = data.get("trade_count", 0)
+                except Exception:
+                    pass
 
         # Get tier info
         if STATE_FILE.exists():

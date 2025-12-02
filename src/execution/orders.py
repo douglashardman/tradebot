@@ -190,6 +190,10 @@ class Position:
             "unrealized_pnl": self.unrealized_pnl,
             "stop_price": self.stop_price,
             "target_price": self.target_price,
+            "bracket_id": self.bracket_id,
+            # Tick values captured at entry - critical for correct P&L on tier changes
+            "tick_size": self.tick_size,
+            "tick_value": self.tick_value,
         }
 
 
