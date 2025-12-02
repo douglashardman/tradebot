@@ -61,6 +61,8 @@ from src.core.capital import (
 from src.execution.bridge import ExecutionBridge
 from src.data.live_db import (
     get_or_create_session as db_get_or_create_session,
+    get_session_by_date as db_get_session_by_date,
+    get_trades_for_session as db_get_trades_for_session,
     end_session as db_end_session,
     log_order as db_log_order,
     update_order_filled as db_update_order_filled,
@@ -146,6 +148,7 @@ class HeadlessTradingSystem:
 
         # Database tracking
         self._db_session_id: Optional[int] = None
+        self._db_session_date: Optional[str] = None  # Track current session date for rollover
         self._trade_count: int = 0
         self._pending_trade_context: dict = {}  # Context for trade being opened
         self._open_trade_ids: dict = {}  # bracket_id -> db trade id
@@ -250,9 +253,9 @@ class HeadlessTradingSystem:
         self.manager.on_position(self._on_position_opened)
 
         # Get or create database session for logging (handles restarts gracefully)
-        today = datetime.now().strftime("%Y-%m-%d")
+        self._db_session_date = datetime.now().strftime("%Y-%m-%d")
         self._db_session_id = db_get_or_create_session(
-            date=today,
+            date=self._db_session_date,
             mode=self.mode,
             symbol=self.symbol,
             tier_index=tier_config.get("tier_index", 0),
@@ -263,7 +266,12 @@ class HeadlessTradingSystem:
             take_profit_ticks=self.session.take_profit_ticks,
             daily_loss_limit=tier_config["daily_loss_limit"],
         )
-        logger.info(f"Using database session #{self._db_session_id}")
+        logger.info(f"Using database session #{self._db_session_id} for {self._db_session_date}")
+
+        # Try to resume session state from persisted state file
+        resumed = self._try_resume_session()
+        if not resumed:
+            logger.info("Starting fresh session (no state to resume)")
 
         # Create order flow engine
         self.engine = OrderFlowEngine({
@@ -889,9 +897,16 @@ class HeadlessTradingSystem:
             if paths:
                 logger.info(f"Saved tick data to: {', '.join(paths)}")
 
-        # Clear persistence (clean shutdown)
-        if self.persistence:
-            self.persistence.clear_state()
+        # Only clear persistence at end of day (after market close)
+        # During RTH, preserve state for mid-day restarts
+        now_et = datetime.now(ET)
+        market_close = get_market_close_time(now_et)
+        if now_et.time() >= market_close:
+            if self.persistence:
+                self.persistence.clear_state()
+                logger.info("End of day - cleared state for tomorrow")
+        else:
+            logger.info("Mid-session shutdown - state preserved for restart")
 
         logger.info("Shutdown complete")
 
@@ -1600,6 +1615,93 @@ class HeadlessTradingSystem:
 
         self.persistence.save_state(state)
 
+    def _try_resume_session(self) -> bool:
+        """Try to resume session from database.
+
+        Pulls today's session data from the database (authoritative source)
+        to restore daily P&L, trade count, and halt state. This ensures
+        restarts don't "forget" earlier trades.
+
+        Returns:
+            True if session was resumed, False if starting fresh.
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Check database for existing session
+        db_session = db_get_session_by_date(today)
+        if not db_session:
+            return False
+
+        # Get trades from database
+        db_trades = db_get_trades_for_session(db_session["id"])
+
+        # Calculate P&L from completed trades
+        daily_pnl = sum(t.get("pnl_net", 0) or 0 for t in db_trades if t.get("exit_price"))
+        trade_count = len([t for t in db_trades if t.get("exit_price")])
+
+        # Check session status
+        is_halted = db_session.get("status") == "HALTED"
+        halt_reason = db_session.get("halted_reason")
+
+        # Apply to execution manager
+        if self.manager:
+            self.manager.daily_pnl = daily_pnl
+            self.manager.is_halted = is_halted
+            self.manager.halt_reason = halt_reason
+
+            # Calculate paper balance from starting balance + P&L
+            if self.session.mode == "paper":
+                starting = db_session.get("starting_balance", self._starting_balance)
+                self.manager.paper_balance = starting + daily_pnl
+
+        # Update trade count for DB logging (so next trade gets correct number)
+        self._trade_count = trade_count
+
+        # Also try to restore additional state from state file (streaks, etc.)
+        if self.persistence:
+            state = self.persistence.load_state()
+            if state:
+                tier_status = state.get("tier_status", {})
+                if tier_status and self.tier_manager:
+                    if "win_streak" in tier_status:
+                        self.tier_manager.state.win_streak = tier_status["win_streak"]
+                    if "loss_streak" in tier_status:
+                        self.tier_manager.state.loss_streak = tier_status["loss_streak"]
+
+        # Update tier manager with session P&L
+        if self.tier_manager:
+            self.tier_manager.state.session_pnl = daily_pnl
+
+        logger.info(
+            f"Resumed session: P&L=${daily_pnl:+.2f}, {trade_count} trades, "
+            f"halted={is_halted}"
+        )
+
+        # Notify Discord about session resume
+        asyncio.create_task(self._notify_session_resumed(daily_pnl, trade_count, is_halted))
+
+        return True
+
+    async def _notify_session_resumed(self, daily_pnl: float, trade_count: int, is_halted: bool) -> None:
+        """Send Discord notification about session resumption."""
+        status = "🔄 Session Resumed"
+        if is_halted:
+            status = "🔄 Session Resumed (HALTED)"
+
+        balance = self.tier_manager.state.balance if self.tier_manager else self._starting_balance
+        pnl_emoji = "📈" if daily_pnl >= 0 else "📉"
+
+        await self.notifications.send_alert(
+            title=status,
+            message=(
+                f"Continuing from previous state:\n"
+                f"{pnl_emoji} **P&L:** ${daily_pnl:+,.2f}\n"
+                f"**Trades:** {trade_count}\n"
+                f"**Balance:** ${balance:,.2f}"
+            ),
+            alert_type=AlertType.INFO,
+        )
+
     def _write_heartbeat(self) -> None:
         """Write heartbeat file for watchdog monitoring."""
         now = datetime.now()
@@ -1609,6 +1711,12 @@ class HeadlessTradingSystem:
             elapsed = (now - self._last_heartbeat_write).total_seconds()
             if elapsed < self._heartbeat_interval:
                 return
+
+        # Check for date rollover (handles long-running processes across midnight)
+        self._check_date_rollover()
+
+        # Save state every heartbeat for crash recovery
+        self._save_state()
 
         try:
             # Ensure data directory exists
@@ -1661,6 +1769,62 @@ class HeadlessTradingSystem:
 
         except Exception as e:
             logger.warning(f"Failed to write heartbeat: {e}")
+
+    def _check_date_rollover(self) -> None:
+        """Check if the date has changed and create a new DB session if needed.
+
+        This handles long-running processes that span midnight without restart.
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        if self._db_session_date and today != self._db_session_date:
+            logger.info(f"Date rollover detected: {self._db_session_date} -> {today}")
+
+            # End the old session
+            if self._db_session_id and self.manager:
+                wins = sum(1 for t in self.manager.completed_trades if t.pnl > 0)
+                losses = len(self.manager.completed_trades) - wins
+                db_end_session(
+                    session_id=self._db_session_id,
+                    ending_balance=self.tier_manager.state.balance if self.tier_manager else 0,
+                    session_pnl=self.manager.daily_pnl,
+                    total_trades=len(self.manager.completed_trades),
+                    wins=wins,
+                    losses=losses,
+                    commissions=self._total_commissions,
+                    status="COMPLETED",
+                )
+                logger.info(f"Ended database session #{self._db_session_id}")
+
+            # Get tier config for new session
+            tier_config = self.tier_manager.get_tier_config() if self.tier_manager else {
+                "tier_index": 0,
+                "tier_name": "Unknown",
+                "balance": self._starting_balance,
+                "max_contracts": 1,
+                "daily_loss_limit": -100,
+            }
+
+            # Create new session for today
+            self._db_session_date = today
+            self._db_session_id = db_get_or_create_session(
+                date=self._db_session_date,
+                mode=self.mode,
+                symbol=self.symbol,
+                tier_index=tier_config.get("tier_index", 0),
+                tier_name=tier_config.get("tier_name"),
+                starting_balance=tier_config["balance"],
+                max_position_size=tier_config["max_contracts"],
+                stop_loss_ticks=self.session.stop_loss_ticks,
+                take_profit_ticks=self.session.take_profit_ticks,
+                daily_loss_limit=tier_config["daily_loss_limit"],
+            )
+            logger.info(f"Created new database session #{self._db_session_id} for {self._db_session_date}")
+
+            # Reset daily counters
+            self._trade_count = 0
+            self._total_commissions = 0.0
+            self._open_trade_ids.clear()
 
 
 async def main():

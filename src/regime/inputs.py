@@ -3,7 +3,13 @@
 from datetime import datetime, time
 from typing import List, Optional
 
+import pytz
+
 from src.core.types import FootprintBar, RegimeInputs
+
+# Timezone for session calculations
+ET = pytz.timezone("America/New_York")
+
 from src.analysis.indicators import (
     OHLC, ema, adx, atr, vwap, calculate_slope, percentile,
     check_higher_highs, check_higher_lows,
@@ -103,10 +109,17 @@ class RegimeInputsCalculator:
         range_bars = count_range_bound_bars(highs, lows, 10)
 
         # Time context - use bar time for backtesting, wall clock for live
+        # Always convert to ET for session calculations
         if self._last_bar_time:
-            current_time = self._last_bar_time.time()
+            # Convert bar time to ET if it has timezone info
+            if self._last_bar_time.tzinfo is not None:
+                bar_time_et = self._last_bar_time.astimezone(ET)
+            else:
+                # Assume UTC if no timezone
+                bar_time_et = pytz.UTC.localize(self._last_bar_time).astimezone(ET)
+            current_time = bar_time_et.time()
         else:
-            current_time = datetime.now().time()
+            current_time = datetime.now(ET).time()
         mins_since_open = self._minutes_since(self.session_open, current_time)
         mins_to_close = self._minutes_until(current_time, self.session_close)
 
@@ -140,9 +153,13 @@ class RegimeInputsCalculator:
         """
         inputs = RegimeInputs()  # Uses dataclass defaults
 
-        # If we have a bar timestamp, use it for time context
+        # If we have a bar timestamp, use it for time context (convert to ET)
         if self._last_bar_time:
-            current_time = self._last_bar_time.time()
+            if self._last_bar_time.tzinfo is not None:
+                bar_time_et = self._last_bar_time.astimezone(ET)
+            else:
+                bar_time_et = pytz.UTC.localize(self._last_bar_time).astimezone(ET)
+            current_time = bar_time_et.time()
             inputs.minutes_since_open = self._minutes_since(self.session_open, current_time)
             inputs.minutes_to_close = self._minutes_until(current_time, self.session_close)
 
