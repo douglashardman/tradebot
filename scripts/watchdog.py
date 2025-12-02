@@ -80,7 +80,8 @@ class WatchdogMonitor:
         self._last_alert_time: dict = {}  # Prevent alert spam
         self._alert_cooldown_minutes = 15
         self._issues_today: list = []
-        self._sent_morning_message = False
+        self._sent_preflight = False
+        self._sent_session_start = False
         self._sent_eod_summary = False
         self._consecutive_heartbeat_failures = 0
         self._process_name = "run_headless.py"
@@ -112,16 +113,22 @@ class WatchdogMonitor:
 
                     # Reset daily flags at midnight
                     if current_time < time(0, 5):
-                        self._sent_morning_message = False
+                        self._sent_preflight = False
+                        self._sent_session_start = False
                         self._sent_eod_summary = False
                         self._issues_today = []
 
                     # During market hours
                     if market_open <= current_time <= close_with_buffer:
-                        # Send morning "System OK" message once
-                        if not self._sent_morning_message and current_time >= time(9, 30):
-                            await self._send_morning_status()
-                            self._sent_morning_message = True
+                        # Send preflight check at 9:25 (5 min before RTH)
+                        if not self._sent_preflight and current_time >= time(9, 25):
+                            await self._send_preflight_check()
+                            self._sent_preflight = True
+
+                        # Send session start at 9:30
+                        if not self._sent_session_start and current_time >= time(9, 30):
+                            await self._send_session_start()
+                            self._sent_session_start = True
 
                         # Run health checks
                         await self._run_health_checks()
@@ -283,44 +290,118 @@ class WatchdogMonitor:
         self._last_alert_time[alert_key] = datetime.now()
         logger.warning(f"ALERT [{severity}]: {message}")
 
-    async def _send_morning_status(self):
-        """Send morning 'system started' message."""
-        # Check current state
+    async def _send_preflight_check(self):
+        """Send preflight check 5 minutes before RTH opens."""
+        # Gather all system checks
         process_ok = self._check_process_running()
-        heartbeat_ok, _ = self._check_heartbeat()
+        heartbeat_ok, heartbeat_msg = self._check_heartbeat()
+        memory_ok, memory_msg = self._check_memory()
+        disk_ok, disk_msg = self._check_disk()
+        connection_ok, connection_msg = self._check_connection_status()
 
-        # Get tier info if available
-        tier_info = ""
+        # Get detailed stats from heartbeat
+        bars = 0
+        ticks = 0
+        signals = 0
+        regime = "Unknown"
+        mode = "unknown"
+        symbol = "?"
+
+        if HEARTBEAT_FILE.exists():
+            try:
+                with open(HEARTBEAT_FILE) as f:
+                    data = json.load(f)
+                bars = data.get("bar_count", 0)
+                ticks = data.get("tick_count", 0)
+                signals = data.get("signal_count", 0)
+                mode = data.get("mode", "unknown")
+                symbol = data.get("symbol", "?")
+            except Exception:
+                pass
+
+        # Get tier info
+        tier_name = "Unknown"
+        balance = 0
         if STATE_FILE.exists():
             try:
                 with open(STATE_FILE) as f:
                     state = json.load(f)
                 tier_name = state.get("tier_name", "Unknown")
                 balance = state.get("balance", 0)
-                tier_info = f"\n**Tier:** {tier_name}\n**Balance:** ${balance:,.2f}"
             except Exception:
                 pass
 
-        if process_ok and heartbeat_ok:
-            status = "✅ System Running"
-            color = 0x00FF00  # Green
-        elif process_ok:
-            status = "⚠️ System Running (heartbeat stale)"
+        # Build checklist
+        checks = []
+        checks.append(f"{'✅' if process_ok else '❌'} Trading process")
+        checks.append(f"{'✅' if heartbeat_ok else '❌'} Heartbeat fresh")
+        checks.append(f"{'✅' if connection_ok else '❌'} Data feed connected")
+        checks.append(f"{'✅' if bars >= 21 else '⚠️'} Regime ready ({bars}/21 bars)")
+        checks.append(f"{'✅' if memory_ok else '⚠️'} Memory OK")
+        checks.append(f"{'✅' if disk_ok else '❌'} Disk space OK")
+
+        # Determine overall status
+        critical_fail = not process_ok or not heartbeat_ok or not disk_ok
+        warning = not connection_ok or not memory_ok or bars < 21
+
+        if critical_fail:
+            status = "❌ NOT READY - Intervention Required"
+            color = 0xFF0000  # Red
+        elif warning:
+            status = "⚠️ READY WITH WARNINGS"
             color = 0xFFA500  # Orange
         else:
-            status = "🚨 System NOT Running"
-            color = 0xFF0000  # Red
+            status = "✅ ALL SYSTEMS GO"
+            color = 0x00FF00  # Green
+
+        checklist_text = "\n".join(checks)
 
         embed = {
-            "title": f"Trading Day Started - {datetime.now(ET).strftime('%A, %B %d')}",
-            "description": f"**Status:** {status}{tier_info}",
+            "title": f"Pre-Flight Check - {datetime.now(ET).strftime('%A, %B %d')}",
+            "description": (
+                f"**{status}**\n\n"
+                f"**Checklist:**\n{checklist_text}\n\n"
+                f"**Session Info:**\n"
+                f"• Mode: {mode.upper()}\n"
+                f"• Symbol: {symbol}\n"
+                f"• Tier: {tier_name}\n"
+                f"• Balance: ${balance:,.2f}\n\n"
+                f"**Pre-Market Stats:**\n"
+                f"• Ticks: {ticks:,}\n"
+                f"• Bars: {bars}\n"
+                f"• Signals: {signals}\n\n"
+                f"RTH opens in 5 minutes."
+            ),
             "color": color,
             "timestamp": datetime.now(pytz.UTC).isoformat(),
             "footer": {"text": "Watchdog Monitor | Next update at market close"},
         }
 
         await self._send_discord(embed)
-        logger.info("Sent morning status message")
+        logger.info(f"Sent preflight check: {status}")
+
+    async def _send_session_start(self):
+        """Send session started message at 9:30."""
+        process_ok = self._check_process_running()
+        heartbeat_ok, _ = self._check_heartbeat()
+
+        if process_ok and heartbeat_ok:
+            status = "✅ Trading Session Started"
+            color = 0x00FF00  # Green
+        else:
+            status = "🚨 Session Started - Issues Detected"
+            color = 0xFF0000  # Red
+
+        embed = {
+            "title": status,
+            "description": "RTH session is now open. Monitoring for signals.",
+            "color": color,
+            "timestamp": datetime.now(pytz.UTC).isoformat(),
+            "footer": {"text": "Watchdog Monitor"},
+        }
+
+        await self._send_discord(embed)
+        logger.info("Sent session start message")
 
     async def _send_eod_summary(self):
         """Send end-of-day summary."""
