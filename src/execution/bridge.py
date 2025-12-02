@@ -23,7 +23,12 @@ class ExecutionBridge:
     - Handle order rejections with notifications
     - Reconcile positions on startup/reconnect
     - Provide crash recovery logic
+    - Handle partial fills with protective actions
     """
+
+    # Partial fill configuration
+    ENTRY_PARTIAL_TIMEOUT_SECONDS = 15.0  # Cancel unfilled entry after this
+    # Note: Exit partials are alert-only; broker's bracket order handles completion
 
     def __init__(
         self,
@@ -31,6 +36,7 @@ class ExecutionBridge:
         rithmic_adapter: RithmicAdapter,
         on_fill_callback: Optional[Callable] = None,
         on_rejection_callback: Optional[Callable] = None,
+        on_partial_fill_callback: Optional[Callable] = None,
     ):
         """
         Initialize execution bridge.
@@ -40,11 +46,13 @@ class ExecutionBridge:
             rithmic_adapter: The RithmicAdapter instance
             on_fill_callback: Optional callback for fill events
             on_rejection_callback: Optional callback for rejection events
+            on_partial_fill_callback: Optional callback for partial fill events
         """
         self.execution_manager = execution_manager
         self.rithmic = rithmic_adapter
         self._on_fill_callback = on_fill_callback
         self._on_rejection_callback = on_rejection_callback
+        self._on_partial_fill_callback = on_partial_fill_callback
 
         # Order tracking: bracket_id -> (BracketOrder, LiveOrder)
         self._pending_brackets: Dict[str, tuple] = {}
@@ -60,6 +68,13 @@ class ExecutionBridge:
 
         # Partial fill tracking: bracket_id -> cumulative filled quantity
         self._entry_fill_totals: Dict[str, int] = {}
+
+        # Partial fill timeout tracking: bracket_id -> (first_partial_time, expected_qty, LiveOrder)
+        self._entry_partial_pending: Dict[str, tuple] = {}
+        # Exit partial tracking: bracket_id -> (partial_time, remaining_qty, exit_type)
+        self._exit_partial_pending: Dict[str, tuple] = {}
+        # Background task for monitoring partial fill timeouts
+        self._partial_fill_monitor_task: Optional[asyncio.Task] = None
 
         # Task tracking: bracket_id -> asyncio.Task for pending submissions
         self._submission_tasks: Dict[str, asyncio.Task] = {}
@@ -242,6 +257,29 @@ class ExecutionBridge:
                     # Mark as filled only on complete fill
                     if live_order.state == OrderState.FILLED:
                         bracket.is_filled = True
+                        # Clear any partial tracking since we're fully filled
+                        self._entry_partial_pending.pop(bracket_id, None)
+                    elif live_order.state == OrderState.PARTIALLY_FILLED:
+                        # Track partial fill for timeout monitoring
+                        filled_so_far = self._entry_fill_totals.get(bracket_id, fill_qty)
+                        expected_qty = bracket.size
+                        if bracket_id not in self._entry_partial_pending:
+                            # First partial - start tracking
+                            self._entry_partial_pending[bracket_id] = (
+                                datetime.now(timezone.utc),
+                                expected_qty,
+                                live_order,
+                            )
+                            logger.warning(
+                                f"Entry partial fill detected: {bracket_id} - "
+                                f"{filled_so_far}/{expected_qty} filled, "
+                                f"timeout in {self.ENTRY_PARTIAL_TIMEOUT_SECONDS}s"
+                            )
+                            # Notify via callback
+                            if self._on_partial_fill_callback:
+                                asyncio.create_task(self._notify_partial_fill(
+                                    "ENTRY", bracket_id, filled_so_far, expected_qty
+                                ))
 
             # Check if this is an exit fill (stop or target)
             is_exit_fill = not live_order.is_entry and live_order.state in (
@@ -274,11 +312,27 @@ class ExecutionBridge:
                         if live_order.state == OrderState.PARTIALLY_FILLED and fill_qty < position.size:
                             # Partial exit - reduce position size
                             old_size = position.size
-                            position.size -= fill_qty
-                            logger.info(
-                                f"Partial exit: {bracket.side} {bracket.symbol} "
-                                f"{old_size} -> {position.size} ({exit_reason} fill: {fill_qty} @ {fill_price})"
+                            remaining_qty = old_size - fill_qty
+                            position.size = remaining_qty
+                            logger.warning(
+                                f"EXIT PARTIAL FILL: {bracket.side} {bracket.symbol} "
+                                f"{old_size} -> {remaining_qty} ({exit_reason} fill: {fill_qty} @ {fill_price}) "
+                                f"- broker should complete remainder (monitoring only)"
                             )
+                            # Track for monitoring (alert-only, no auto market-out)
+                            # Broker's bracket order should complete the remainder
+                            self._exit_partial_pending[bracket_id] = (
+                                datetime.now(timezone.utc),
+                                remaining_qty,
+                                exit_reason,
+                                position,
+                                bracket,
+                            )
+                            # Alert via callback - let broker handle completion
+                            if self._on_partial_fill_callback:
+                                asyncio.create_task(self._notify_partial_fill(
+                                    f"EXIT_{exit_reason}_PARTIAL", bracket_id, fill_qty, old_size
+                                ))
                         else:
                             # Full exit - close the position
                             self._close_position(position, fill_price, exit_reason)
@@ -643,6 +697,177 @@ class ExecutionBridge:
             "tracked_positions": len(self._order_to_position),
             "pending_submissions": len(self._submission_tasks),
             "failed_submissions": len(self._failed_submissions),
+            "entry_partials_pending": len(self._entry_partial_pending),
+            "exit_partials_pending": len(self._exit_partial_pending),
             "broker_connected": self.rithmic._connected,
             "execution_halted": self.execution_manager.is_halted,
         }
+
+    # === Partial Fill Handling ===
+
+    async def start_partial_fill_monitor(self) -> None:
+        """Start the background task that monitors partial fill timeouts."""
+        if self._partial_fill_monitor_task is not None:
+            logger.warning("Partial fill monitor already running")
+            return
+
+        self._partial_fill_monitor_task = asyncio.create_task(
+            self._monitor_partial_fills()
+        )
+        logger.info("Partial fill monitor started")
+
+    async def stop_partial_fill_monitor(self) -> None:
+        """Stop the partial fill monitor task."""
+        if self._partial_fill_monitor_task is not None:
+            self._partial_fill_monitor_task.cancel()
+            try:
+                await self._partial_fill_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._partial_fill_monitor_task = None
+            logger.info("Partial fill monitor stopped")
+
+    async def _monitor_partial_fills(self) -> None:
+        """
+        Background task that monitors entry partial fills for timeout.
+
+        Runs every second, checks if any entry partial has exceeded
+        ENTRY_PARTIAL_TIMEOUT_SECONDS and triggers cancel + trade-with-what-we-have.
+        """
+        logger.info("Partial fill monitor running")
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                now = datetime.now(timezone.utc)
+
+                # Check entry partials for timeout
+                timed_out = []
+                for bracket_id, (partial_time, expected_qty, live_order) in self._entry_partial_pending.items():
+                    elapsed = (now - partial_time).total_seconds()
+                    if elapsed >= self.ENTRY_PARTIAL_TIMEOUT_SECONDS:
+                        timed_out.append(bracket_id)
+
+                # Handle timeouts (outside iteration to avoid dict modification)
+                for bracket_id in timed_out:
+                    await self._handle_entry_partial_timeout(bracket_id)
+
+        except asyncio.CancelledError:
+            logger.info("Partial fill monitor cancelled")
+            raise
+
+    async def _handle_entry_partial_timeout(self, bracket_id: str) -> None:
+        """
+        Handle entry partial fill timeout.
+
+        Cancels unfilled portion and continues trading with what we got.
+        """
+        if bracket_id not in self._entry_partial_pending:
+            return
+
+        partial_time, expected_qty, live_order = self._entry_partial_pending.pop(bracket_id)
+        filled_qty = self._entry_fill_totals.get(bracket_id, 0)
+        unfilled_qty = expected_qty - filled_qty
+
+        logger.warning(
+            f"Entry partial timeout: {bracket_id} - "
+            f"filled {filled_qty}/{expected_qty}, canceling {unfilled_qty} unfilled"
+        )
+
+        # Cancel the unfilled portion
+        try:
+            if live_order and live_order.order_id:
+                cancelled = await self.rithmic.cancel_order(live_order.order_id)
+                if cancelled:
+                    logger.info(f"Cancelled unfilled entry order: {live_order.order_id}")
+                else:
+                    logger.warning(f"Failed to cancel entry order: {live_order.order_id}")
+        except Exception as e:
+            logger.error(f"Error cancelling entry order: {e}")
+
+        # Notify via callback
+        if self._on_partial_fill_callback:
+            await self._notify_partial_fill(
+                "ENTRY_TIMEOUT", bracket_id, filled_qty, expected_qty
+            )
+
+        # Position already exists with partial size - stops/targets should be in place
+        # Nothing else to do, we continue with what we have
+
+    async def emergency_market_out(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+    ) -> bool:
+        """
+        Emergency market order to close a position.
+
+        USE WITH CAUTION: This is for manual intervention only when
+        broker orders have failed or gotten stuck. Using this while
+        broker orders are still working could cause double-fills.
+
+        Args:
+            symbol: Contract symbol (e.g., "MESH5")
+            side: Position side ("LONG" or "SHORT") - order will be opposite
+            quantity: Number of contracts to close
+
+        Returns:
+            True if order submitted, False otherwise.
+        """
+        order_side = "SELL" if side == "LONG" else "BUY"
+
+        logger.warning(
+            f"EMERGENCY MARKET OUT: {order_side} {quantity} {symbol} @ MARKET"
+        )
+
+        try:
+            success = await self.rithmic.submit_market_order(
+                symbol=symbol,
+                side=order_side,
+                quantity=quantity,
+            )
+
+            if success:
+                logger.info(f"Emergency market order submitted for {quantity} {symbol}")
+                if self._on_partial_fill_callback:
+                    await self._notify_partial_fill(
+                        "EMERGENCY_MARKET_OUT", "manual", quantity, quantity
+                    )
+            else:
+                logger.error(f"FAILED to submit emergency market order!")
+                if self._on_partial_fill_callback:
+                    await self._notify_partial_fill(
+                        "EMERGENCY_MARKET_OUT_FAILED", "manual", 0, quantity
+                    )
+
+            return success
+
+        except Exception as e:
+            logger.error(f"Exception in emergency market out: {e}")
+            return False
+
+    async def _notify_partial_fill(
+        self,
+        event_type: str,
+        bracket_id: str,
+        filled_qty: int,
+        total_qty: int,
+    ) -> None:
+        """Send partial fill notification via callback."""
+        if not self._on_partial_fill_callback:
+            return
+
+        try:
+            event = {
+                "type": event_type,
+                "bracket_id": bracket_id,
+                "filled_qty": filled_qty,
+                "total_qty": total_qty,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            if asyncio.iscoroutinefunction(self._on_partial_fill_callback):
+                await self._on_partial_fill_callback(event)
+            else:
+                self._on_partial_fill_callback(event)
+        except Exception as e:
+            logger.error(f"Error in partial fill callback: {e}")

@@ -56,6 +56,9 @@ This document tracks all backtesting experiments, parameters, results, and actio
 - [Test 18: Capital Simulation](#test-18-capital-simulation)
 - [Test 19: Worst Case Stress Test](#test-19-worst-case-stress-test)
 
+### Failed Experiments (23)
+- [Test 23: Tight Scalping (4-tick TP / 2-tick SL)](#test-23-tight-scalping-4-tick-tp--2-tick-sl)
+
 ### Summary
 - [Tier Progression Summary](#tier-progression-summary)
 - [Results Summary (All Tests)](#results-summary-all-tests)
@@ -1221,6 +1224,79 @@ The MES tier provides excellent downside protection.
 
 ---
 
+# Failed Experiments (23)
+
+## Test 23: Tight Scalping (4-tick TP / 2-tick SL)
+
+| | |
+|---|---|
+| **Date Run** | December 2, 2025 |
+| **Script** | `scripts/scalping_test.py` |
+| **Contract** | ESH5 (March 2025) |
+
+### Hypothesis
+
+Test a tight scalping strategy with 4-tick take profit and 2-tick stop loss. With 2:1 reward/risk, only need 33% win rate to break even.
+
+### Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Take Profit | 4 ticks (1 point, $50) |
+| Stop Loss | 2 ticks (0.5 points, $25) |
+| Entry Slippage | 1 tick |
+| Reward/Risk | 2:1 |
+| Test Period | Jan 13 - Feb 21, 2025 |
+| Trading Days | 30 |
+
+### Results
+
+| Metric | Scalping (4/2) | Baseline (16/24) |
+|--------|----------------|------------------|
+| Total P&L | **-$4,900** | +$71,741 |
+| Total Trades | 331 | 208 |
+| Win Rate | 13.6% | ~68% |
+| Winning Days | 1 (3%) | 23 (77%) |
+| Losing Days | 28 (93%) | 7 (23%) |
+
+### Exit Reason Breakdown
+
+| Exit Reason | Count | Percentage | P&L |
+|-------------|-------|------------|-----|
+| Take Profit | 45 | 13.6% | +$2,250 |
+| Stop Loss | 286 | 86.4% | -$7,150 |
+| End of Day | 0 | 0% | $0 |
+
+### Daily Breakdown (Selected)
+
+| Date | P&L | Trades | Win Rate |
+|------|-----|--------|----------|
+| 2025-01-14 | -$275 | 11 | 0% |
+| 2025-01-22 | -$275 | 11 | 0% |
+| 2025-01-29 | -$250 | 10 | 0% |
+| 2025-02-18 | +$75 | 6 | 50% |
+| 2025-02-19 | -$325 | 13 | 0% |
+
+Best day: Feb 18 (+$75) - the only profitable day in 30.
+
+### Why It Failed
+
+1. **2-tick stop is too tight** - ES moves 0.5 points constantly from normal market noise. Trades get stopped out before the signal can play out.
+
+2. **86% hit stop loss** - Only 45 of 331 trades reached the 4-tick target. The rest got stopped out immediately.
+
+3. **Win rate too low** - Need 33%+ to break even with 2:1 R/R. Achieved only 13.6%.
+
+4. **Signals predict direction, not immediate movement** - The order flow signals are good at predicting where price will go, but they need room to breathe. A 2-tick stop gives no room for the normal back-and-forth before the move.
+
+### Finding
+
+Tight scalping does not work with order flow signals. The signals predict direction over the next several minutes, not the next few ticks. The baseline 16-tick SL / 24-tick TP gives trades room to work.
+
+**Verdict: MASSIVE FAILURE (-$4,900 vs +$71,741) - NEVER USE TIGHT STOPS**
+
+---
+
 # Results Summary (All Tests)
 
 ## Performance Ranking
@@ -1298,10 +1374,11 @@ The MES tier provides excellent downside protection.
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/run_tier_backtest.py` | Tier progression backtest |
-| `scripts/run_databento_backtest.py` | Single day or batch backtest |
+| `testing/run_tier_backtest.py` | Tier progression backtest |
+| `testing/run_databento_backtest.py` | Single day or batch backtest |
 | `scripts/download_historical_data.py` | Download tick data from Databento |
-| `scripts/advanced_backtest.py` | All advanced tests (4-19) |
+| `testing/advanced_backtest.py` | All advanced tests (4-19) |
+| `testing/scalping_test.py` | Tight scalping test (Test 23) |
 
 ---
 
@@ -1316,4 +1393,4 @@ The MES tier provides excellent downside protection.
 
 ---
 
-*Last Updated: November 30, 2025*
+*Last Updated: December 2, 2025*

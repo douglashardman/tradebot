@@ -739,6 +739,73 @@ class RithmicAdapter:
             logger.error(f"Failed to cancel all orders: {e}")
             return False
 
+    async def submit_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        exchange: str = "CME",
+    ) -> bool:
+        """
+        Submit a simple market order (no bracket).
+
+        Used for closing out partial fill remainders where we just
+        need to exit immediately at market price.
+
+        Args:
+            symbol: Contract symbol (e.g., "MESH5")
+            side: "BUY" or "SELL"
+            quantity: Number of contracts
+            exchange: Exchange (default "CME")
+
+        Returns:
+            True if order submitted, False otherwise.
+        """
+        if not self.client or not self._connected:
+            logger.error("Cannot submit market order: not connected to Rithmic")
+            return False
+
+        if not self.account_id:
+            logger.error("Cannot submit market order: account_id not configured")
+            return False
+
+        try:
+            from async_rithmic import OrderType, TransactionType
+
+            # Generate order ID
+            order_id = f"MKT_{uuid.uuid4().hex[:8]}"
+
+            # Map side to transaction type
+            if side == "BUY":
+                txn_type = TransactionType.BUY
+            elif side == "SELL":
+                txn_type = TransactionType.SELL
+            else:
+                logger.error(f"Invalid side for market order: {side}")
+                return False
+
+            logger.info(
+                f"Submitting market order: {side} {quantity} {symbol} @ MARKET"
+            )
+
+            # Submit simple market order (no stop/target)
+            await self.client.submit_order(
+                order_id=order_id,
+                security_code=symbol,
+                exchange=exchange,
+                qty=quantity,
+                order_type=OrderType.MARKET,
+                transaction_type=txn_type,
+                account_id=self.account_id,
+            )
+
+            logger.info(f"Market order submitted: {order_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to submit market order: {e}")
+            return False
+
     async def exit_position(
         self,
         symbol: str,
