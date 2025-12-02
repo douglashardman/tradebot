@@ -143,6 +143,8 @@ class TickLogger:
         """
         Flush accumulated ticks to Parquet file.
 
+        If file already exists, appends new ticks to it (preserves data across restarts).
+
         Args:
             date: Specific date to flush (YYYY-MM-DD), or None for current date
 
@@ -161,13 +163,26 @@ class TickLogger:
             logger.warning(f"No ticks to flush for {date_to_flush}")
             return None
 
-        # Convert to PyArrow table
-        table = pa.Table.from_pylist(ticks, schema=self.SCHEMA)
+        # Convert new ticks to PyArrow table
+        new_table = pa.Table.from_pylist(ticks, schema=self.SCHEMA)
 
-        # Write to Parquet
+        # Check if file already exists - if so, append to it
         output_path = os.path.join(self.output_dir, f"{date_to_flush}.parquet")
+        if os.path.exists(output_path):
+            try:
+                existing_table = pq.read_table(output_path)
+                # Concatenate existing + new ticks
+                combined_table = pa.concat_tables([existing_table, new_table])
+                logger.info(f"Appending {len(ticks):,} ticks to existing {len(existing_table):,} ticks")
+            except Exception as e:
+                logger.warning(f"Could not read existing parquet, overwriting: {e}")
+                combined_table = new_table
+        else:
+            combined_table = new_table
+
+        # Write combined data to Parquet
         pq.write_table(
-            table,
+            combined_table,
             output_path,
             compression="snappy",  # Good balance of speed/size
             use_dictionary=True,   # Efficient for string columns
@@ -178,8 +193,8 @@ class TickLogger:
         file_size_mb = file_size / (1024 * 1024)
 
         logger.info(
-            f"Flushed {len(ticks):,} ticks for {date_to_flush} "
-            f"to {output_path} ({file_size_mb:.2f} MB)"
+            f"Flushed {len(ticks):,} new ticks for {date_to_flush} "
+            f"(total: {len(combined_table):,}) to {output_path} ({file_size_mb:.2f} MB)"
         )
 
         # Clear flushed data from memory

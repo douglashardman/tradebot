@@ -1741,6 +1741,18 @@ class HeadlessTradingSystem:
         # Save state every heartbeat for crash recovery
         self._save_state()
 
+        # Flush tick data periodically (every 5 minutes) to prevent data loss on crash
+        if self.tick_logger and self._tick_count > 0:
+            if not hasattr(self, '_last_tick_flush') or self._last_tick_flush is None:
+                self._last_tick_flush = now
+            elif (now - self._last_tick_flush).total_seconds() >= 300:  # 5 minutes
+                try:
+                    self.tick_logger.flush_all()
+                    self._last_tick_flush = now
+                    logger.debug("Periodic tick flush completed")
+                except Exception as e:
+                    logger.warning(f"Periodic tick flush failed: {e}")
+
         try:
             # Ensure data directory exists
             os.makedirs(os.path.dirname(HEARTBEAT_FILE), exist_ok=True)
