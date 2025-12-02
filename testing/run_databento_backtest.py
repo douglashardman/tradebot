@@ -141,17 +141,11 @@ def run_backtest(
         "timeframe": 300,  # 5-minute bars
     })
 
-    # Session times in UTC (Databento timestamps are UTC)
-    # 9:30 ET = 14:30 UTC, 16:00 ET = 21:00 UTC
+    # Use defaults to match 198-day backtest that produced +$426K
+    # Session times must be in ET (the inputs calculator converts tick times to ET)
     router = StrategyRouter({
-        "min_signal_strength": 0.60,
-        "min_regime_confidence": 0.50,
-        "session_open": time(14, 30),   # 9:30 ET in UTC
-        "session_close": time(21, 0),   # 16:00 ET in UTC
-        "regime": {
-            "min_regime_score": 3.5,
-            "adx_trend_threshold": 25,
-        },
+        "session_open": time(9, 30),    # ET
+        "session_close": time(16, 0),   # ET
     })
 
     # Pre-market warmup: Load 7:00-9:30 AM data to warm up regime detector

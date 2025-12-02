@@ -279,16 +279,10 @@ class HeadlessTradingSystem:
             "timeframe": self.timeframe,
         })
 
-        # Create strategy router with validated backtest parameters
-        # These settings were validated against 198 days of historical data
-        self.router = StrategyRouter({
-            "min_signal_strength": 0.60,
-            "min_regime_confidence": 0.50,
-            "regime": {
-                "min_regime_score": 3.5,
-                "adx_trend_threshold": 25,
-            },
-        })
+        # Create strategy router with defaults
+        # Defaults (min_signal_strength=0.50, min_regime_confidence=0.60,
+        # min_regime_score=4.0) match the 198-day backtest that produced +$426K
+        self.router = StrategyRouter({})
 
         # Wire up callbacks
         self.engine.on_bar(self._on_bar)

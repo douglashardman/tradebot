@@ -262,11 +262,11 @@ class AdvancedBacktester:
         # Setup components
         engine = OrderFlowEngine({"symbol": symbol, "timeframe": 300})
 
+        # Use defaults to match 198-day backtest that produced +$426K
+        # Session times must be in ET (the inputs calculator converts tick times to ET)
         router = StrategyRouter({
-            "min_signal_strength": 0.60,
-            "min_regime_confidence": 0.50,
-            "session_open": time(14, 30),
-            "session_close": time(21, 0),
+            "session_open": time(9, 30),    # ET
+            "session_close": time(16, 0),   # ET
         })
 
         trading_session = TradingSession(
