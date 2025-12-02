@@ -230,36 +230,36 @@ def run_backtest(
             if len(trades) >= MAX_TRADES_PER_DAY:
                 return  # Skip - already hit max trades for day
             if not manager.pending_orders and not manager.open_positions:
-                if signal.strength >= 0.60:
-                    multiplier = router.get_position_size_multiplier()
-                    order = manager.on_signal(signal, multiplier)
-                    if order:
-                        # Get current regime info
-                        regime_state = router.get_state()
-                        regime_name = regime_state.get("current_regime", "UNKNOWN")
-                        regime_score = regime_state.get("regime_confidence", 0)
+                # Router already checks min_signal_strength (0.60) - no redundant check needed
+                multiplier = router.get_position_size_multiplier()
+                order = manager.on_signal(signal, multiplier)
+                if order:
+                    # Get current regime info
+                    regime_state = router.get_state()
+                    regime_name = regime_state.get("current_regime", "UNKNOWN")
+                    regime_score = regime_state.get("regime_confidence", 0)
 
-                        pattern_name = signal.pattern.value if hasattr(signal.pattern, 'value') else str(signal.pattern)
+                    pattern_name = signal.pattern.value if hasattr(signal.pattern, 'value') else str(signal.pattern)
 
-                        trade_record = {
-                            "num": len(trades) + 1,
-                            "entry_time": current_tick.timestamp if current_tick else datetime.now(),
-                            "pattern": pattern_name,
-                            "direction": signal.direction,
-                            "entry_price": order.entry_price,
-                            "stop_price": order.stop_price,
-                            "target_price": order.target_price,
-                            "strength": signal.strength,
-                            "regime": regime_name,
-                            "regime_score": regime_score,
-                            "exit_time": None,
-                            "exit_price": None,
-                            "pnl": 0,
-                            "exit_reason": None,
-                        }
-                        trades.append(trade_record)
-                        print(f"  TRADE #{len(trades)}: {order.side} @ {order.entry_price:.2f} "
-                              f"(regime={regime_name}, pattern={pattern_name})")
+                    trade_record = {
+                        "num": len(trades) + 1,
+                        "entry_time": current_tick.timestamp if current_tick else datetime.now(),
+                        "pattern": pattern_name,
+                        "direction": signal.direction,
+                        "entry_price": order.entry_price,
+                        "stop_price": order.stop_price,
+                        "target_price": order.target_price,
+                        "strength": signal.strength,
+                        "regime": regime_name,
+                        "regime_score": regime_score,
+                        "exit_time": None,
+                        "exit_price": None,
+                        "pnl": 0,
+                        "exit_reason": None,
+                    }
+                    trades.append(trade_record)
+                    print(f"  TRADE #{len(trades)}: {order.side} @ {order.entry_price:.2f} "
+                          f"(regime={regime_name}, pattern={pattern_name})")
 
     engine.on_bar(on_bar)
     engine.on_signal(on_signal)
