@@ -154,6 +154,36 @@ def run_backtest(
         },
     })
 
+    # Pre-market warmup: Load 7:00-9:30 AM data to warm up regime detector
+    # This aligns backtest with live system which also warms up before RTH
+    warmup_cache_path = get_cache_path(contract, date, "07:00", "09:30")
+    warmup_ticks = load_cached_ticks(warmup_cache_path)
+
+    if not warmup_ticks:
+        # Fetch warmup data from Databento
+        print(f"Fetching pre-market warmup data (07:00-09:30)...")
+        warmup_adapter = DatabentoAdapter()
+        warmup_ticks = warmup_adapter.get_session_ticks(
+            contract=contract,
+            date=date,
+            start_time="07:00",
+            end_time="09:30"
+        )
+        if warmup_ticks:
+            save_ticks_to_cache(warmup_ticks, warmup_cache_path)
+
+    # Build warmup bars and feed to router (but don't generate trade signals)
+    if warmup_ticks:
+        from src.data.aggregator import FootprintAggregator
+        warmup_aggregator = FootprintAggregator(300)  # 5-min bars
+        warmup_bars = 0
+        for tick in warmup_ticks:
+            bar = warmup_aggregator.process_tick(tick)
+            if bar:
+                router.on_bar(bar)
+                warmup_bars += 1
+        print(f"Warmed up router with {warmup_bars} pre-market bars | Regime: {router.current_regime.value}")
+
     session = TradingSession(
         mode="paper",
         symbol=symbol,

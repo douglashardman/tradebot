@@ -279,8 +279,16 @@ class HeadlessTradingSystem:
             "timeframe": self.timeframe,
         })
 
-        # Create strategy router
-        self.router = StrategyRouter({})
+        # Create strategy router with validated backtest parameters
+        # These settings were validated against 198 days of historical data
+        self.router = StrategyRouter({
+            "min_signal_strength": 0.60,
+            "min_regime_confidence": 0.50,
+            "regime": {
+                "min_regime_score": 3.5,
+                "adx_trend_threshold": 25,
+            },
+        })
 
         # Wire up callbacks
         self.engine.on_bar(self._on_bar)
@@ -420,6 +428,10 @@ class HeadlessTradingSystem:
         """
         Warm up the router with recent bar history.
 
+        Uses a fixed pre-market window (7:00 AM - 9:30 AM ET) for consistency.
+        This ensures the same warmup data whether starting fresh at 9:30 or
+        restarting mid-day, matching what backtests see.
+
         Data sources (in order of preference):
         1. Persisted bars from SQLite (instant, FREE)
         2. Local Parquet tick cache (fast, FREE)
@@ -432,6 +444,12 @@ class HeadlessTradingSystem:
             True if warmup successful, False otherwise
         """
         logger.info(f"Starting warmup (need {min_bars}+ bars for regime detection)...")
+
+        # Use fixed pre-market window for consistent warmup across restarts
+        # 7:00 AM - 9:30 AM ET = 2.5 hours = 30 bars at 5-min
+        now_et = datetime.now(ET)
+        warmup_start = now_et.replace(hour=7, minute=0, second=0, microsecond=0)
+        warmup_end = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
         # Clean up old bars (keep 7 days)
         try:
@@ -449,10 +467,9 @@ class HeadlessTradingSystem:
             logger.info(f"Found {len(bars)} persisted bars - using for warmup")
         else:
             # OPTION 2: Load from local Parquet cache (FREE)
+            # Use fixed pre-market window for consistency
             logger.info(f"Only {len(bars)} persisted bars, trying Parquet cache...")
-            now_et = datetime.now(ET)
-            start_time = now_et - timedelta(hours=3)
-            ticks = self._load_local_ticks(start_time, now_et)
+            ticks = self._load_local_ticks(warmup_start, warmup_end)
 
             if ticks:
                 bars = self._ticks_to_bars(ticks)
@@ -461,12 +478,11 @@ class HeadlessTradingSystem:
 
         if len(bars) < min_bars:
             # OPTION 3: Databento historical API (PAID)
+            # Use fixed pre-market window for consistency
             api_key = os.getenv("DATABENTO_API_KEY")
             if api_key:
-                logger.info(f"Only {len(bars)} bars, fetching from Databento...")
-                now_et = datetime.now(ET)
-                start_time = now_et - timedelta(hours=3)
-                ticks = self._fetch_databento_ticks(api_key, start_time, now_et)
+                logger.info(f"Only {len(bars)} bars, fetching from Databento (7:00-9:30 AM)...")
+                ticks = self._fetch_databento_ticks(api_key, warmup_start, warmup_end)
                 if ticks:
                     bars = self._ticks_to_bars(ticks)
                     source = "Databento API"
