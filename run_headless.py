@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Headless Trading System - No Web Server, Discord Only
+Headless Trading System - No Web Server
 
 Designed for locked-down servers:
 - No exposed ports
-- All status via Discord webhooks (outbound only)
+- All notifications via external webhook script (scripts/webhook_alert.py)
 - Auto-starts via systemd
 - Runs trading session 9:30 AM - 4:00 PM ET
 - Auto-flattens 5 minutes before close
 - Sends daily digest at 4:00 PM ET
 
 Environment variables required:
-- RITHMIC_USER, RITHMIC_PASSWORD
-- DISCORD_WEBHOOK_URL
+- RITHMIC_USER, RITHMIC_PASSWORD (for live mode)
+- DATABENTO_API_KEY (for paper mode)
+- DISCORD_WEBHOOK_URL (for notifications)
 
 Usage:
     python run_headless.py              # Production with Rithmic
@@ -39,12 +40,8 @@ from src.analysis.engine import OrderFlowEngine
 from src.regime.router import StrategyRouter
 from src.execution.manager import ExecutionManager
 from src.execution.session import TradingSession
-from src.core.notifications import (
-    NotificationService,
-    DailyDigest,
-    AlertType,
-    configure_notifications,
-)
+import subprocess
+import json as json_module  # For webhook payloads
 from src.core.persistence import StatePersistence, get_persistence
 from src.core.scheduler import (
     TradingScheduler,
@@ -132,7 +129,6 @@ class HeadlessTradingSystem:
         self.session: Optional[TradingSession] = None
         self.manager: Optional[ExecutionManager] = None
         self.data_adapter = None
-        self.notifications: Optional[NotificationService] = None
         self.persistence: Optional[StatePersistence] = None
         self.scheduler: Optional[TradingScheduler] = None
         self.tier_manager: Optional[TierManager] = None
@@ -174,6 +170,38 @@ class HeadlessTradingSystem:
         # Tick logging for Parquet storage
         self.tick_logger: Optional[TickLogger] = None
 
+        # Webhook script path
+        self._webhook_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "scripts",
+            "webhook_alert.py"
+        )
+
+    def _send_webhook(self, event_type: str, data: dict) -> None:
+        """
+        Fire-and-forget webhook notification.
+
+        Spawns the webhook script as a subprocess so notifications don't
+        block trading logic. If the script fails, trading continues.
+        """
+        try:
+            # Add test mode flag if in paper mode
+            args = ["python3", self._webhook_script]
+            if self.mode == "paper":
+                args.append("--test")
+            args.extend([event_type, json_module.dumps(data)])
+
+            # Fire and forget - don't wait for completion
+            subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # Fully detach from parent
+            )
+        except Exception as e:
+            # Never let notification failures affect trading
+            logger.debug(f"Webhook spawn failed (non-critical): {e}")
+
     async def setup(self) -> bool:
         """Initialize all components."""
         logger.info("=" * 60)
@@ -183,20 +211,9 @@ class HeadlessTradingSystem:
         logger.info(f"Mode: {self.mode}")
         logger.info(f"Dry run: {self.dry_run}")
 
-        # Set up notifications first (so we can alert on errors)
-        webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-        if not webhook_url:
-            logger.error("DISCORD_WEBHOOK_URL not set!")
-            return False
-
-        self.notifications = configure_notifications(
-            webhook_url=webhook_url,
-            bot_name=os.getenv("BOT_NAME", "TradeBot"),
-            alert_on_trades=True,  # We want all notifications in headless mode
-            alert_on_connection=True,
-            alert_on_limits=True,
-            alert_on_errors=True,
-        )
+        # Verify webhook URL is configured (notifications via subprocess)
+        if not os.getenv("DISCORD_WEBHOOK_URL"):
+            logger.warning("DISCORD_WEBHOOK_URL not set - notifications disabled")
 
         # Set up persistence
         self.persistence = get_persistence()
@@ -206,11 +223,11 @@ class HeadlessTradingSystem:
         if not is_trading_day(now_et):
             reason = "weekend" if now_et.weekday() >= 5 else "holiday"
             logger.info(f"Not a trading day ({reason}). Exiting.")
-            await self.notifications.send_alert(
-                title="No Trading Today",
-                message=f"Market closed ({reason}). System will try again tomorrow.",
-                alert_type=AlertType.INFO,
-            )
+            self._send_webhook("alert", {
+                "title": "No Trading Today",
+                "message": f"Market closed ({reason}). System will try again tomorrow.",
+                "type": "info",
+            })
             # Exit with code 0 so systemd doesn't restart (this is expected, not a failure)
             sys.exit(0)
 
@@ -331,19 +348,21 @@ class HeadlessTradingSystem:
 
             if not user or not password:
                 logger.error("RITHMIC_USER and RITHMIC_PASSWORD required")
-                await self.notifications.alert_system_error(
-                    "Rithmic credentials missing",
-                    "Set RITHMIC_USER and RITHMIC_PASSWORD environment variables",
-                )
+                self._send_webhook("alert", {
+                    "title": "Rithmic credentials missing",
+                    "message": "Set RITHMIC_USER and RITHMIC_PASSWORD environment variables",
+                    "type": "error",
+                })
                 return False
 
             # For live mode, account_id is required
             if self.mode == "live" and not account_id:
                 logger.error("RITHMIC_ACCOUNT_ID required for live trading")
-                await self.notifications.alert_system_error(
-                    "Rithmic account ID missing",
-                    "Set RITHMIC_ACCOUNT_ID for live trading",
-                )
+                self._send_webhook("alert", {
+                    "title": "Rithmic account ID missing",
+                    "message": "Set RITHMIC_ACCOUNT_ID for live trading",
+                    "type": "error",
+                })
                 return False
 
             self.data_adapter = RithmicAdapter(
@@ -361,19 +380,21 @@ class HeadlessTradingSystem:
 
             logger.info("Connecting to Rithmic...")
             if not await self.data_adapter.connect():
-                await self.notifications.alert_system_error(
-                    "Failed to connect to Rithmic",
-                    "Check credentials and network connectivity",
-                )
+                self._send_webhook("alert", {
+                    "title": "Failed to connect to Rithmic",
+                    "message": "Check credentials and network connectivity",
+                    "type": "error",
+                })
                 return False
 
             # Subscribe to market data
             exchange = "CME"
             if not await self.data_adapter.subscribe(self.symbol, exchange):
-                await self.notifications.alert_system_error(
-                    f"Failed to subscribe to {self.symbol}",
-                    "Check symbol and exchange",
-                )
+                self._send_webhook("alert", {
+                    "title": f"Failed to subscribe to {self.symbol}",
+                    "message": "Check symbol and exchange",
+                    "type": "error",
+                })
                 return False
 
             logger.info(f"Connected to Rithmic, streaming {self.symbol}")
@@ -394,10 +415,11 @@ class HeadlessTradingSystem:
                 reconcile_result = await self.execution_bridge.reconcile_on_startup()
                 if not reconcile_result.get("reconciled"):
                     # Position mismatch - session already halted by bridge
-                    await self.notifications.alert_system_error(
-                        "Position mismatch on startup",
-                        reconcile_result.get("action_required", "Manual review required"),
-                    )
+                    self._send_webhook("alert", {
+                        "title": "Position mismatch on startup",
+                        "message": reconcile_result.get("action_required", "Manual review required"),
+                        "type": "error",
+                    })
                     return False
 
                 logger.info("Execution bridge initialized for live trading")
@@ -406,17 +428,19 @@ class HeadlessTradingSystem:
 
         except ImportError:
             logger.error("async_rithmic not installed")
-            await self.notifications.alert_system_error(
-                "async_rithmic not installed",
-                "Run: pip install async_rithmic",
-            )
+            self._send_webhook("alert", {
+                "title": "async_rithmic not installed",
+                "message": "Run: pip install async_rithmic",
+                "type": "error",
+            })
             return False
         except Exception as e:
             logger.error(f"Rithmic connection error: {e}")
-            await self.notifications.alert_system_error(
-                "Rithmic connection error",
-                str(e),
-            )
+            self._send_webhook("alert", {
+                "title": "Rithmic connection error",
+                "message": str(e),
+                "type": "error",
+            })
             return False
 
     async def warmup_historical(self, min_bars: int = 30) -> bool:
@@ -513,14 +537,11 @@ class HeadlessTradingSystem:
         )
 
         # Send Discord notification
-        await self.notifications.send_alert(
-            title="System Warmed Up",
-            message=(
-                f"Loaded {warmup_bars} bars from {source}\n"
-                f"Starting regime: **{regime}** ({confidence:.0%})"
-            ),
-            alert_type=AlertType.INFO,
-        )
+        self._send_webhook("alert", {
+            "title": "System Warmed Up",
+            "message": f"Loaded {warmup_bars} bars from {source}\nStarting regime: **{regime}** ({confidence:.0%})",
+            "type": "info",
+        })
 
         return True
 
@@ -615,10 +636,11 @@ class HeadlessTradingSystem:
             api_key = os.getenv("DATABENTO_API_KEY")
             if not api_key:
                 logger.error("DATABENTO_API_KEY required")
-                await self.notifications.alert_system_error(
-                    "Databento API key missing",
-                    "Set DATABENTO_API_KEY environment variable",
-                )
+                self._send_webhook("alert", {
+                    "title": "Databento API key missing",
+                    "message": "Set DATABENTO_API_KEY environment variable",
+                    "type": "error",
+                })
                 return False
 
             self.data_adapter = DatabentoAdapter(api_key=api_key)
@@ -644,10 +666,11 @@ class HeadlessTradingSystem:
 
         except Exception as e:
             logger.error(f"Databento connection error: {e}")
-            await self.notifications.alert_system_error(
-                "Databento connection error",
-                str(e),
-            )
+            self._send_webhook("alert", {
+                "title": "Databento connection error",
+                "message": str(e),
+                "type": "error",
+            })
             return False
 
     async def _check_margin_requirements(self) -> bool:
@@ -696,32 +719,32 @@ class HeadlessTradingSystem:
             if margin_high and not self._margin_is_high:
                 self._margin_is_high = True
                 logger.warning(f"Margins elevated: ${current_margin:.2f} > ${margin_limit:.2f} limit")
-                await self.notifications.send_alert(
-                    title="⚠️ High Margins - Pausing Trades",
-                    message=(
+                self._send_webhook("alert", {
+                    "title": "⚠️ High Margins - Pausing Trades",
+                    "message": (
                         f"**Symbol:** {self.symbol}\n"
                         f"**Current Margin:** ${current_margin:.2f}\n"
                         f"**Normal Limit:** ${margin_limit:.2f}\n\n"
                         f"Skipping new trades until margins normalize.\n"
                         f"Existing positions are unaffected."
                     ),
-                    alert_type=AlertType.WARNING,
-                )
+                    "type": "warning",
+                })
                 return False
 
             # State transition: high -> normal
             if not margin_high and self._margin_is_high:
                 self._margin_is_high = False
                 logger.info(f"Margins normalized: ${current_margin:.2f} <= ${margin_limit:.2f}")
-                await self.notifications.send_alert(
-                    title="✅ Margins Normalized - Resuming Trades",
-                    message=(
+                self._send_webhook("alert", {
+                    "title": "✅ Margins Normalized - Resuming Trades",
+                    "message": (
                         f"**Symbol:** {self.symbol}\n"
                         f"**Current Margin:** ${current_margin:.2f}\n\n"
                         f"Margins are back to normal. Trading resumed."
                     ),
-                    alert_type=AlertType.SUCCESS,
-                )
+                    "type": "success",
+                })
                 return True
 
             return not self._margin_is_high
@@ -745,18 +768,14 @@ class HeadlessTradingSystem:
                 f"**Win Streak:** {tier_info['win_streak']} | **Loss Streak:** {tier_info['loss_streak']}\n\n"
             )
 
-        await self.notifications.send_alert(
-            title="Trading Session Started",
-            message=(
-                f"{tier_msg}"
-                f"**Symbol:** {self.symbol}\n"
-                f"**Mode:** {self.mode}\n"
-                f"**Profit Target:** ${self.session.daily_profit_target:,.0f}\n"
-                f"**Loss Limit:** ${abs(self.session.daily_loss_limit):,.0f}\n"
-                f"**Max Position:** {self.session.max_position_size} contracts"
-            ),
-            alert_type=AlertType.SUCCESS,
-        )
+        self._send_webhook("session_start", {
+            "balance": tier_info['balance'] if tier_info else self._starting_balance,
+            "tier": tier_info['tier_name'] if tier_info else "Tier 1",
+            "symbol": self.symbol,
+            "mode": self.mode,
+            "profit_target": self.session.daily_profit_target,
+            "loss_limit": self.session.daily_loss_limit,
+        })
 
         # Start scheduler
         self.scheduler.start()
@@ -811,7 +830,11 @@ class HeadlessTradingSystem:
             logger.info("Session cancelled")
         except Exception as e:
             logger.error(f"Session error: {e}")
-            await self.notifications.alert_system_error("Session error", str(e))
+            self._send_webhook("alert", {
+                "title": "Session error",
+                "message": str(e),
+                "type": "error",
+            })
         finally:
             await self.shutdown()
 
@@ -825,11 +848,11 @@ class HeadlessTradingSystem:
             wait_seconds = (open_dt - now_et).total_seconds()
             logger.info(f"Waiting {wait_seconds/60:.1f} minutes for market open")
 
-            await self.notifications.send_alert(
-                title="Waiting for Market Open",
-                message=f"Trading will begin at 9:30 AM ET ({wait_seconds/60:.0f} minutes)",
-                alert_type=AlertType.INFO,
-            )
+            self._send_webhook("alert", {
+                "title": "Waiting for Market Open",
+                "message": f"Trading will begin at 9:30 AM ET ({wait_seconds/60:.0f} minutes)",
+                "type": "info",
+            })
 
             await asyncio.sleep(wait_seconds)
 
@@ -898,10 +921,6 @@ class HeadlessTradingSystem:
                 await self.data_adapter.stop_live_async()
             elif hasattr(self.data_adapter, 'stop_live'):
                 self.data_adapter.stop_live()
-
-        # Close notifications
-        if self.notifications:
-            await self.notifications.close()
 
         # Flush tick data to Parquet before shutdown
         if self.tick_logger:
@@ -1208,7 +1227,11 @@ class HeadlessTradingSystem:
                 plant_type=plant_type,
             )
 
-        await self.notifications.alert_connection_restored(plant_type)
+        self._send_webhook("alert", {
+            "title": "Connection Restored",
+            "message": f"Data feed reconnected: {plant_type}",
+            "type": "success",
+        })
 
     async def _on_feed_disconnected(self, plant_type: str = "") -> None:
         """Handle data feed disconnection."""
@@ -1225,7 +1248,11 @@ class HeadlessTradingSystem:
                 plant_type=plant_type,
             )
 
-        await self.notifications.alert_connection_lost(plant_type)
+        self._send_webhook("alert", {
+            "title": "Connection Lost",
+            "message": f"Data feed disconnected: {plant_type}",
+            "type": "error",
+        })
 
     async def _on_session_halted(self) -> None:
         """Handle session halt."""
@@ -1233,15 +1260,22 @@ class HeadlessTradingSystem:
         pnl = self.manager.daily_pnl
 
         if "loss limit" in reason.lower():
-            await self.notifications.alert_daily_loss_limit(pnl)
+            self._send_webhook("session_halted", {
+                "reason": "Daily loss limit reached",
+                "daily_pnl": pnl,
+            })
         elif "profit target" in reason.lower():
-            await self.notifications.alert_daily_profit_target(pnl)
+            self._send_webhook("alert", {
+                "title": "🎯 Profit Target Reached",
+                "message": f"Daily P&L: ${pnl:+,.2f}",
+                "type": "success",
+            })
         else:
-            await self.notifications.send_alert(
-                title="Session Halted",
-                message=f"**Reason:** {reason}\n**Daily P&L:** ${pnl:+,.2f}",
-                alert_type=AlertType.WARNING,
-            )
+            self._send_webhook("alert", {
+                "title": "Session Halted",
+                "message": f"**Reason:** {reason}\n**Daily P&L:** ${pnl:+,.2f}",
+                "type": "warning",
+            })
 
     async def _on_live_fill(self, fill_data: dict) -> None:
         """Handle fill notification from live trading."""
@@ -1290,15 +1324,15 @@ class HeadlessTradingSystem:
                 self._db_order_ids.pop(bracket_id, None)
 
         # Alert via Discord
-        await self.notifications.send_alert(
-            title="Order Rejected",
-            message=(
+        self._send_webhook("alert", {
+            "title": "Order Rejected",
+            "message": (
                 f"**Order ID:** {rithmic_order_id}\n"
                 f"**Reason:** {reason}\n\n"
                 "Manual intervention may be required."
             ),
-            alert_type=AlertType.ERROR,
-        )
+            "type": "error",
+        })
 
     async def _on_tier_change(self, change: dict) -> None:
         """Handle tier change - send Discord notification, update session, and log to DB."""
@@ -1383,49 +1417,41 @@ class HeadlessTradingSystem:
         )
 
         # Send Discord notification
-        await self.notifications.send_alert(
-            title=f"{emoji} Tier Change: {direction}!",
-            message=(
-                f"**{old_tier['name']}** -> **{new_tier['name']}**\n\n"
-                f"**Balance:** ${change['balance']:,.2f}\n"
-                f"**Instrument:** {change['from_instrument']} -> {change['to_instrument']}\n"
-                f"**Max Contracts:** {old_tier['max_contracts']} -> {new_tier['max_contracts']}\n"
-                f"**Loss Limit:** ${abs(old_tier['daily_loss_limit'])} -> ${abs(new_tier['daily_loss_limit'])}"
-            ),
-            alert_type=AlertType.SUCCESS if direction == "UP" else AlertType.WARNING,
-        )
+        self._send_webhook("tier_change", {
+            "from_tier": change["from_tier"],
+            "to_tier": change["to_tier"],
+            "from_tier_name": old_tier["name"],
+            "to_tier_name": new_tier["name"],
+            "from_instrument": change["from_instrument"],
+            "to_instrument": change["to_instrument"],
+            "balance": change["balance"],
+        })
 
     # === Alert Helpers ===
 
     async def _alert_position_opened(self, position) -> None:
         """Send Discord alert for new position."""
-        emoji = "📈" if position.side == "LONG" else "📉"
-        await self.notifications.send_alert(
-            title=f"Position Opened",
-            message=(
-                f"{emoji} **{position.side}** {position.size} {position.symbol}\n"
-                f"**Entry:** {position.entry_price:.2f}\n"
-                f"**Stop:** {position.stop_price:.2f}\n"
-                f"**Target:** {position.target_price:.2f}"
-            ),
-            alert_type=AlertType.TRADE_OPEN,
-        )
+        self._send_webhook("position_opened", {
+            "direction": position.side,
+            "size": position.size,
+            "symbol": position.symbol,
+            "entry_price": position.entry_price,
+            "stop_price": position.stop_price,
+            "target_price": position.target_price,
+        })
 
     async def _alert_trade_closed(self, trade) -> None:
         """Send Discord alert for closed trade."""
-        emoji = "✅" if trade.pnl >= 0 else "❌"
-        pnl_str = f"+${trade.pnl:,.2f}" if trade.pnl >= 0 else f"-${abs(trade.pnl):,.2f}"
-
-        await self.notifications.send_alert(
-            title=f"Trade Closed",
-            message=(
-                f"{emoji} **{trade.side}** {trade.size} {trade.symbol}\n"
-                f"**Entry:** {trade.entry_price:.2f} → **Exit:** {trade.exit_price:.2f}\n"
-                f"**P&L:** {pnl_str} ({trade.exit_reason})\n"
-                f"**Daily P&L:** ${self.manager.daily_pnl:+,.2f}"
-            ),
-            alert_type=AlertType.TRADE_CLOSE if trade.pnl >= 0 else AlertType.WARNING,
-        )
+        self._send_webhook("position_closed", {
+            "direction": trade.side,
+            "size": trade.size,
+            "symbol": trade.symbol,
+            "entry_price": trade.entry_price,
+            "exit_price": trade.exit_price,
+            "pnl": trade.pnl,
+            "exit_type": trade.exit_reason,
+            "daily_pnl": self.manager.daily_pnl if self.manager else 0,
+        })
 
     # === Scheduled Tasks ===
 
@@ -1448,25 +1474,25 @@ class HeadlessTradingSystem:
                     verified_msg = "\n**Status:** Verified - all positions closed"
                 elif flatten_result.get("broker_positions") is not None:
                     verified_msg = f"\n**Warning:** {flatten_result['broker_positions']} position(s) may still be open"
-                await self.notifications.send_alert(
-                    title="Auto-Flatten Initiated",
-                    message=(
+                self._send_webhook("alert", {
+                    "title": "Auto-Flatten Initiated",
+                    "message": (
                         f"Sent flatten request for {num_positions} position(s) before market close.\n"
                         f"**Current Daily P&L:** ${self.manager.daily_pnl:+,.2f}"
                         f"{verified_msg}"
                     ),
-                    alert_type=AlertType.INFO,
-                )
+                    "type": "info",
+                })
             else:
-                await self.notifications.send_alert(
-                    title="Auto-Flatten FAILED",
-                    message=(
+                self._send_webhook("alert", {
+                    "title": "Auto-Flatten FAILED",
+                    "message": (
                         f"Failed to send flatten request!\n"
                         f"**Open Positions:** {num_positions}\n\n"
                         "MANUAL INTERVENTION REQUIRED"
                     ),
-                    alert_type=AlertType.ERROR,
-                )
+                    "type": "error",
+                })
             return
 
         # Paper mode: simulate flatten locally
@@ -1484,15 +1510,15 @@ class HeadlessTradingSystem:
         trades = self.manager.close_all_positions(current_price, "AUTO_FLATTEN")
 
         total_pnl = sum(t.pnl for t in trades)
-        await self.notifications.send_alert(
-            title="Auto-Flatten Complete",
-            message=(
+        self._send_webhook("alert", {
+            "title": "Auto-Flatten Complete",
+            "message": (
                 f"Closed {len(trades)} position(s) before market close.\n"
                 f"**P&L from flatten:** ${total_pnl:+,.2f}\n"
                 f"**Final Daily P&L:** ${self.manager.daily_pnl:+,.2f}"
             ),
-            alert_type=AlertType.INFO if total_pnl >= 0 else AlertType.WARNING,
-        )
+            "type": "info" if total_pnl >= 0 else "warning",
+        })
 
     async def _send_daily_digest(self) -> None:
         """Send end-of-day summary."""
@@ -1561,25 +1587,14 @@ class HeadlessTradingSystem:
         if tier_info:
             status += f" | {tier_info['tier_name']}"
 
-        digest = DailyDigest(
-            date=datetime.now().strftime("%Y-%m-%d"),
-            session_start="09:30",
-            session_end=get_market_close_time().strftime("%H:%M"),
-            status=status,
-            starting_balance=starting_balance,
-            ending_balance=ending_balance,
-            day_pnl=day_pnl,
-            trades=total_trades,
-            wins=wins,
-            losses=losses,
-            win_rate=win_rate,
-            trades_detail=trades_detail,
-            regime_breakdown=regime_breakdown,
-            current_position=position_str,
-            account_balance=ending_balance,
-        )
-
-        await self.notifications.send_daily_digest(digest)
+        # Send daily digest via webhook
+        self._send_webhook("daily_digest", {
+            "pnl": day_pnl,
+            "trade_count": total_trades,
+            "win_rate": win_rate,
+            "ending_balance": ending_balance,
+            "status": status,
+        })
 
     # === Balance Polling ===
 
@@ -1734,18 +1749,17 @@ class HeadlessTradingSystem:
             status = "🔄 Session Resumed (HALTED)"
 
         balance = self.tier_manager.state.balance if self.tier_manager else self._starting_balance
-        pnl_emoji = "📈" if daily_pnl >= 0 else "📉"
 
-        await self.notifications.send_alert(
-            title=status,
-            message=(
+        self._send_webhook("alert", {
+            "title": status,
+            "message": (
                 f"Continuing from previous state:\n"
-                f"{pnl_emoji} **P&L:** ${daily_pnl:+,.2f}\n"
+                f"**P&L:** ${daily_pnl:+,.2f}\n"
                 f"**Trades:** {trade_count}\n"
                 f"**Balance:** ${balance:,.2f}"
             ),
-            alert_type=AlertType.INFO,
-        )
+            "type": "info",
+        })
 
     def _write_heartbeat(self) -> None:
         """Write heartbeat file for watchdog monitoring."""
