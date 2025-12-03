@@ -191,6 +191,7 @@ class HeadlessTradingSystem:
 
         self.notifications = configure_notifications(
             webhook_url=webhook_url,
+            bot_name=os.getenv("BOT_NAME", "TradeBot"),
             alert_on_trades=True,  # We want all notifications in headless mode
             alert_on_connection=True,
             alert_on_limits=True,
@@ -673,7 +674,9 @@ class HeadlessTradingSystem:
         MES_LIMIT = float(os.getenv("MES_MARGIN_LIMIT", "50"))
         ES_LIMIT = float(os.getenv("ES_MARGIN_LIMIT", "500"))
 
-        if not self.data_adapter:
+        # Only check margins in live mode (via Rithmic through execution_bridge)
+        # Paper mode skips margin checks - no real money at risk
+        if not self.execution_bridge:
             return True
 
         # Get the base symbol
@@ -681,7 +684,7 @@ class HeadlessTradingSystem:
         margin_limit = MES_LIMIT if base_symbol == "MES" else ES_LIMIT
 
         try:
-            current_margin = await self.data_adapter.get_margin_requirement(self.symbol, "CME")
+            current_margin = await self.execution_bridge.get_margin_requirement(self.symbol, "CME")
 
             if current_margin is None:
                 # Can't query - use cached state or allow trade
@@ -939,6 +942,13 @@ class HeadlessTradingSystem:
         if self.engine:
             self.engine.process_tick(tick)
 
+        # TICK-LEVEL STOP/TARGET CHECKING
+        # Check stops and targets on EVERY tick while positions are open
+        # This ensures we exit immediately when price hits our levels,
+        # not waiting for bar close which could miss intra-bar moves
+        if self.manager and self.manager.open_positions:
+            self.manager.update_prices(tick.price)
+
         # Save state periodically
         if self._tick_count % 10000 == 0:
             self._save_state()
@@ -978,7 +988,9 @@ class HeadlessTradingSystem:
             except Exception as e:
                 logger.warning(f"Failed to persist regime: {e}")
 
-        if bar.close_price and self.manager:
+        # Safety net: also check at bar close (primary checking is tick-level in _process_tick)
+        # This handles edge cases where tick-level check might have been skipped
+        if bar.close_price and self.manager and self.manager.open_positions:
             self.manager.update_prices(bar.close_price)
 
     def _on_signal(self, signal: Signal) -> None:
@@ -1843,7 +1855,7 @@ class HeadlessTradingSystem:
                 logger.info(f"Ended database session #{self._db_session_id}")
 
             # Get tier config for new session
-            tier_config = self.tier_manager.get_tier_config() if self.tier_manager else {
+            tier_config = self.tier_manager.get_status() if self.tier_manager else {
                 "tier_index": 0,
                 "tier_name": "Unknown",
                 "balance": self._starting_balance,
@@ -1871,6 +1883,22 @@ class HeadlessTradingSystem:
             self._trade_count = 0
             self._total_commissions = 0.0
             self._open_trade_ids.clear()
+
+            # Reset in-memory trading state for new day
+            if self.manager:
+                self.manager.daily_pnl = 0
+                self.manager.completed_trades = []
+                self.manager.is_halted = False
+                self.manager.halt_reason = None
+
+            # Reset tier session P&L (balance carries over, session P&L resets)
+            if self.tier_manager:
+                self.tier_manager.state.session_pnl = 0
+
+            # Reset daily flags
+            self._daily_digest_sent = False
+
+            logger.info(f"Daily state reset complete for {today}")
 
 
 async def main():
