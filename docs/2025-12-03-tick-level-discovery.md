@@ -180,15 +180,23 @@ We verified the production code matches backtest logic exactly:
 4. Exits happen immediately when levels hit
 5. Faster position turnover allows more trades per day
 
+### Why Tick-Level is Correct (Not Just "Better")
+
+Bar-level checking wasn't "letting winners run" - it was showing **phantom wins that never would have happened** with a real broker. When price hits your stop, the broker fills it. The matching engine doesn't wait for bar close to see if price recovers.
+
+Tick-level isn't optimistic - it's *accurate*. Previous backtests were validating against fiction. Trades that "survived" stop hits in bar-level simulation would have been stopped out in production.
+
+This reframes the win rate question: tick-level may show *fewer* wins, but those are the *real* wins. Bar-level was inflating win rates with trades that would have lost money in live execution.
+
 ### Expected Improvements
 - Capture targets that would have been missed at bar close
-- Avoid stops when price temporarily spikes then recovers
-- Results should align closely with backtest expectations
+- Results should align closely with what a real broker would execute
+- Paper trading now accurately simulates live behavior
 - Estimated improvement: 20-40% better P&L on similar market days
 
 ### What to Watch For
 - Trade count (should be similar to or higher than before)
-- Win rate (may be slightly lower due to faster stops, but more wins overall)
+- Win rate (may appear lower - this is more accurate, not worse)
 - P&L per trade (should be more consistent - 6 pts target or 4 pts stop)
 - Total daily P&L (primary metric - should improve)
 
